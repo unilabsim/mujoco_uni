@@ -203,7 +203,7 @@ class BuildCMakeExtension(build_ext.build_ext):
         os.path.dirname(self.get_ext_fullpath(self.extensions[0].name)),
         'plugin',
     )
-    os.makedirs(dst)
+    os.makedirs(dst, exist_ok=True)
     for directory, _, filenames in os.walk(self._mujoco_plugins_path):
       for pattern in get_plugin_lib_patterns():
         for filename in fnmatch.filter(filenames, pattern):
@@ -216,7 +216,7 @@ class BuildCMakeExtension(build_ext.build_ext):
         os.path.dirname(self.get_ext_fullpath(self.extensions[0].name)),
         'include/mujoco',
     )
-    os.makedirs(dst)
+    os.makedirs(dst, exist_ok=True)
     for directory, _, filenames in os.walk(self._mujoco_include_path):
       for filename in fnmatch.filter(filenames, '*.h'):
         shutil.copyfile(
@@ -229,14 +229,14 @@ class BuildCMakeExtension(build_ext.build_ext):
         os.path.dirname(self.get_ext_fullpath(self.extensions[0].name)),
         'MuJoCo_(mjpython).app/Contents',
     )
-    os.makedirs(dst_contents_dir)
+    os.makedirs(dst_contents_dir, exist_ok=True)
     shutil.copyfile(
         os.path.join(src_dir, 'Info.plist'),
         os.path.join(dst_contents_dir, 'Info.plist'),
     )
 
     dst_bin_dir = os.path.join(dst_contents_dir, 'MacOS')
-    os.makedirs(dst_bin_dir)
+    os.makedirs(dst_bin_dir, exist_ok=True)
     shutil.copyfile(
         os.path.join(self.build_temp, 'mjpython'),
         os.path.join(dst_bin_dir, 'mjpython'),
@@ -244,7 +244,7 @@ class BuildCMakeExtension(build_ext.build_ext):
     os.chmod(os.path.join(dst_bin_dir, 'mjpython'), 0o755)
 
     dst_resources_dir = os.path.join(dst_contents_dir, 'Resources')
-    os.makedirs(dst_resources_dir)
+    os.makedirs(dst_resources_dir, exist_ok=True)
     shutil.copyfile(
         os.path.join(src_dir, 'mjpython.icns'),
         os.path.join(dst_resources_dir, 'mjpython.icns'),
@@ -369,6 +369,7 @@ setuptools.setup(
         CMakeExtension('mujoco._functions'),
         CMakeExtension('mujoco._render'),
         CMakeExtension('mujoco._rollout'),
+        CMakeExtension('mujoco._rollout_mlx'),
         CMakeExtension('mujoco._simulate'),
         CMakeExtension('mujoco._specs'),
         CMakeExtension('mujoco._structs'),

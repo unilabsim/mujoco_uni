@@ -3,12 +3,12 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco"
-version = "3.5.0"
+name = "mujoco-mlx"
+version = "3.5.0.post2"
 authors = [
-    {name = "Google DeepMind", email = "mujoco@deepmind.com"},
+    {name = "TATP-233"},
 ]
-description = "MuJoCo Physics Simulator"
+description = "MuJoCo Physics Simulator with MLX rollout support for macOS"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 classifiers = [
@@ -21,21 +21,24 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Operating System :: MacOS",
+    "Operating System :: MacOS :: MacOS X",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
     "absl-py",
     "etils[epath]",
     "glfw",
+    "mlx; platform_system == 'Darwin'",
     "numpy",
     "pyopengl",
 ]
 dynamic = ["readme", "scripts"]
 
 [project.urls]
-Homepage = "https://github.com/google-deepmind/mujoco"
+Homepage = "https://github.com/TATP-233/mujoco"
 Documentation = "https://mujoco.readthedocs.io/en/3.5.0"
-Repository = "https://github.com/google-deepmind/mujoco"
+Repository = "https://github.com/TATP-233/mujoco"
 Changelog = "https://mujoco.readthedocs.io/en/3.5.0/changelog.html"
 
 [tool.setuptools]
