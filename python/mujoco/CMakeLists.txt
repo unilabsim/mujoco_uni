@@ -411,8 +411,8 @@ target_link_libraries(
 mujoco_pybind11_module(_rollout rollout.cc threadpool.cc)
 target_link_libraries(_rollout PRIVATE functions_header mujoco raw)
 
-mujoco_pybind11_module(_rollout_mlx rollout_mlx_bind.cc threadpool.cc)
-target_link_libraries(_rollout_mlx PRIVATE functions_header mujoco raw)
+mujoco_pybind11_module(_mlx_step mlx_step_bind.cc threadpool.cc)
+target_link_libraries(_mlx_step PRIVATE functions_header mujoco raw)
 
 mujoco_pybind11_module(
   _structs
@@ -478,7 +478,7 @@ set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_functions>"
     "$<TARGET_FILE:_render>"
     "$<TARGET_FILE:_rollout>"
-    "$<TARGET_FILE:_rollout_mlx>"
+    "$<TARGET_FILE:_mlx_step>"
     "$<TARGET_FILE:_simulate>"
     "$<TARGET_FILE:_specs>"
     "$<TARGET_FILE:_structs>"
@@ -515,7 +515,7 @@ if(MUJOCO_PYTHON_MAKE_WHEEL)
     _functions
     _render
     _rollout
-    _rollout_mlx
+    _mlx_step
     _simulate
     _specs
     _structs

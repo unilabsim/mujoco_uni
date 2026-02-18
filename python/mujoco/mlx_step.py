@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""MLX step wrapper backed by native _rollout_mlx pybind."""
+"""MLX simulation-step wrapper backed by native pybind."""
 
 from __future__ import annotations
 
@@ -16,32 +16,32 @@ from typing import Optional, Union
 
 import mlx.core as mx
 import mujoco
-from mujoco import _rollout_mlx
+from mujoco import _mlx_step as _native_mlx_step
 
 
 ModelLike = Union[mujoco.MjModel, Sequence[mujoco.MjModel]]
 DataLike = Union[mujoco.MjData, Sequence[mujoco.MjData]]
 
 
-class RolloutMLX:
-    """Rollout object containing a thread pool for parallel rollouts."""
+class MlxStepRunner:
+    """Simulation-step runner with an internal parallel worker pool."""
 
     def __init__(self, *, nthread: Optional[int] = None):
         self.nthread = 0 if nthread is None else int(nthread)
-        self._rollout = _rollout_mlx.RolloutMLX(nthread=self.nthread)
+        self._runner = _native_mlx_step.MlxStepRunner(nthread=self.nthread)
 
-    def __enter__(self) -> "RolloutMLX":
+    def __enter__(self) -> "MlxStepRunner":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
     def close(self) -> None:
-        if self._rollout is not None:
-            del self._rollout
-            self._rollout = None
+        if self._runner is not None:
+            del self._runner
+            self._runner = None
 
-    def rollout(
+    def step(
         self,
         model: ModelLike,
         data: DataLike,
@@ -54,8 +54,8 @@ class RolloutMLX:
         chunk_size: Optional[int] = None,
         out_dtype: mx.Dtype = mx.float32,
     ):
-        if self._rollout is None:
-            raise RuntimeError("rollout requested after thread pool shutdown")
+        if self._runner is None:
+            raise RuntimeError("step requested after thread pool shutdown")
 
         if not isinstance(model, list):
             model = [model]
@@ -69,7 +69,7 @@ class RolloutMLX:
                 control_arr = mx.array(control)
                 nstep = int(control_arr.shape[1]) if control_arr.ndim >= 2 else 1
 
-        return self._rollout.rollout(
+        return self._runner.step(
             model,
             data,
             int(nstep),
@@ -80,7 +80,6 @@ class RolloutMLX:
             chunk_size,
             out_dtype,
         )
-
 
 persistent_mlx_step = None
 
@@ -110,8 +109,8 @@ def mlx_step(
     if not isinstance(data, list):
         data = [data]
     nthread = len(data) if len(data) > 1 else 0
-    with RolloutMLX(nthread=nthread) as runner:
-        return runner.rollout(
+    with MlxStepRunner(nthread=nthread) as runner:
+        return runner.step(
             model=model,
             data=data,
             initial_state=initial_state,
@@ -122,8 +121,3 @@ def mlx_step(
             chunk_size=chunk_size,
             out_dtype=out_dtype,
         )
-
-
-# Backward compatibility names.
-rollout = mlx_step
-rollout_mlx = mlx_step

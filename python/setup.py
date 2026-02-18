@@ -152,6 +152,11 @@ class BuildCMakeExtension(build_ext.build_ext):
         self._mujoco_plugins_path,
         self._mujoco_framework_path,
     ) = self._find_mujoco()
+    self._mujoco_source_root = (
+        os.environ[MUJOCO_PATH]
+        if MUJOCO_PATH in os.environ
+        else os.path.join(os.path.dirname(__file__), 'mujoco')
+    )
     self._configure_cmake()
     for ext in self.extensions:
       assert ext.name.startswith(EXT_PREFIX)
@@ -164,34 +169,52 @@ class BuildCMakeExtension(build_ext.build_ext):
       self._copy_mjpython()
 
   def _find_mujoco(self):
-    if MUJOCO_PATH not in os.environ:
-      raise RuntimeError(f'{MUJOCO_PATH} environment variable is not set')
-    if MUJOCO_PLUGIN_PATH not in os.environ:
+    """Locate MuJoCo lib/headers. Prefer MUJOCO_PATH; fallback to bundled."""
+    pkg_dir = os.path.join(os.path.dirname(__file__), 'mujoco')
+
+    def _search_root(root):
+      library_path = None
+      include_path = None
+      for directory, subdirs, filenames in os.walk(root):
+        if self._is_apple and 'mujoco.framework' in subdirs:
+          plugin_path = os.path.join(root, 'plugin')
+          return (
+              os.path.join(directory, 'mujoco.framework/Versions/A'),
+              os.path.join(directory, 'mujoco.framework/Headers'),
+              plugin_path,
+              directory,
+          )
+        if fnmatch.filter(filenames, get_mujoco_lib_pattern()):
+          library_path = directory
+        if os.path.exists(os.path.join(directory, 'mujoco', 'mujoco.h')):
+          include_path = directory
+        if library_path and include_path:
+          plugin_path = os.path.join(root, 'plugin')
+          return library_path, include_path, plugin_path, None
+      return None
+
+    if MUJOCO_PATH in os.environ and MUJOCO_PLUGIN_PATH in os.environ:
+      result = _search_root(os.environ[MUJOCO_PATH])
+      if result:
+        return result
       raise RuntimeError(
-          f'{MUJOCO_PLUGIN_PATH} environment variable is not set'
+          'Cannot find MuJoCo library and/or include paths in MUJOCO_PATH'
       )
-    library_path = None
-    include_path = None
-    plugin_path = os.environ[MUJOCO_PLUGIN_PATH]
-    for directory, subdirs, filenames in os.walk(os.environ[MUJOCO_PATH]):
-      if self._is_apple and 'mujoco.framework' in subdirs:
-        return (
-            os.path.join(directory, 'mujoco.framework/Versions/A'),
-            os.path.join(directory, 'mujoco.framework/Headers'),
-            plugin_path,
-            directory,
-        )
-      if fnmatch.filter(filenames, get_mujoco_lib_pattern()):
-        library_path = directory
-      if os.path.exists(os.path.join(directory, 'mujoco/mujoco.h')):
-        include_path = directory
-      if library_path and include_path:
-        return library_path, include_path, plugin_path, None
-    raise RuntimeError('Cannot find MuJoCo library and/or include paths')
+
+    # Fallback: use bundled lib/headers in package (for pip install from sdist)
+    if os.path.isdir(pkg_dir):
+      result = _search_root(pkg_dir)
+      if result:
+        return result
+
+    raise RuntimeError(
+        f'{MUJOCO_PATH} environment variable is not set, and no bundled '
+        'MuJoCo found in package. Install from a wheel or set MUJOCO_PATH.'
+    )
 
   def _copy_external_libraries(self):
     dst = os.path.dirname(self.get_ext_fullpath(self.extensions[0].name))
-    for directory, _, filenames in os.walk(os.environ[MUJOCO_PATH]):
+    for directory, _, filenames in os.walk(self._mujoco_source_root):
       for pattern in get_external_lib_patterns():
         for filename in fnmatch.filter(filenames, pattern):
           shutil.copyfile(
@@ -204,6 +227,8 @@ class BuildCMakeExtension(build_ext.build_ext):
         'plugin',
     )
     os.makedirs(dst, exist_ok=True)
+    if not os.path.isdir(self._mujoco_plugins_path):
+      return
     for directory, _, filenames in os.walk(self._mujoco_plugins_path):
       for pattern in get_plugin_lib_patterns():
         for filename in fnmatch.filter(filenames, pattern):
@@ -369,7 +394,7 @@ setuptools.setup(
         CMakeExtension('mujoco._functions'),
         CMakeExtension('mujoco._render'),
         CMakeExtension('mujoco._rollout'),
-        CMakeExtension('mujoco._rollout_mlx'),
+        CMakeExtension('mujoco._mlx_step'),
         CMakeExtension('mujoco._simulate'),
         CMakeExtension('mujoco._specs'),
         CMakeExtension('mujoco._structs'),
