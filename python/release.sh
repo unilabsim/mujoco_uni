@@ -8,11 +8,12 @@ UPLOAD_PYPI=0
 SMOKE_TESTPYPI=0
 BUILD_ALL_PYTHON=0
 UPLOAD_ONLY=0
+SKIP_EXISTING=0
 
 usage() {
   cat <<'EOF'
 Usage:
-  bash release.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only]
+  bash release.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only] [--skip-existing]
 
 Options:
   --upload-testpypi   Upload dist/* to TestPyPI via ~/.pypirc (repo: testpypi)
@@ -20,6 +21,7 @@ Options:
   --smoke-testpypi    After upload, install from TestPyPI in a clean venv and smoke test
   --build-all-python  Build wheels for Python 3.9, 3.10, 3.11, 3.12 via conda (avoids local compile for users)
   --upload-only       Skip build, only upload existing dist/* (use when build succeeded but upload failed)
+  --skip-existing     Pass --skip-existing to twine upload (ignore files already on index)
 EOF
 }
 
@@ -45,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       UPLOAD_ONLY=1
       shift
       ;;
+    --skip-existing)
+      SKIP_EXISTING=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -58,24 +64,40 @@ while [[ $# -gt 0 ]]; do
 done
 
 activate_conda_env() {
-  if [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "$HOME/anaconda3/etc/profile.d/conda.sh"
-    if conda activate mlx >/dev/null 2>&1; then
-      echo "[env] activated conda env: mlx"
-      return 0
-    fi
+  local conda_init_script=""
+  local fallback_env="mj_wheel_py310"
+
+  [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]] && conda_init_script="$HOME/anaconda3/etc/profile.d/conda.sh"
+  [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]] && conda_init_script="$HOME/miniconda3/etc/profile.d/conda.sh"
+
+  if [[ -z "$conda_init_script" ]]; then
+    echo "[env] conda init script not found (checked anaconda3/miniconda3)" >&2
+    exit 1
   fi
-  if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-    # shellcheck disable=SC1091
-    source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    if conda activate mj_env >/dev/null 2>&1; then
-      echo "[env] activated conda env: mj_env"
-      return 0
-    fi
+
+  # shellcheck disable=SC1090
+  source "$conda_init_script"
+
+  if conda activate mlx >/dev/null 2>&1; then
+    echo "[env] activated conda env: mlx"
+    return 0
   fi
-  echo "[env] failed to activate 'mlx' or 'mj_env'" >&2
-  exit 1
+
+  if conda activate mj_env >/dev/null 2>&1; then
+    echo "[env] activated conda env: mj_env"
+    return 0
+  fi
+
+  echo "[env] 'mlx' and 'mj_env' not found, fallback to: ${fallback_env}"
+  if conda activate "$fallback_env" >/dev/null 2>&1; then
+    echo "[env] activated conda env: ${fallback_env}"
+    return 0
+  fi
+
+  echo "[env] creating fallback conda env: ${fallback_env} (python=3.10)"
+  conda create -n "$fallback_env" python=3.10 -y
+  conda activate "$fallback_env"
+  echo "[env] activated newly created conda env: ${fallback_env}"
 }
 
 get_version() {
@@ -87,6 +109,10 @@ cd "$ROOT_DIR"
 
 VERSION="$(get_version)"
 UPSTREAM_VERSION="${VERSION%%.post*}"
+TWINE_UPLOAD_ARGS=()
+if [[ "$SKIP_EXISTING" -eq 1 ]]; then
+  TWINE_UPLOAD_ARGS+=(--skip-existing)
+fi
 echo "[info] package version: ${VERSION}"
 echo "[info] upstream version: ${UPSTREAM_VERSION}"
 
@@ -99,10 +125,10 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
   python -m pip install -q twine 2>/dev/null || true
   python -m twine check dist/*
   if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
-    python -m twine upload -r testpypi dist/*
+    python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
   fi
   if [[ "$UPLOAD_PYPI" -eq 1 ]]; then
-    python -m twine upload -r pypi dist/*
+    python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r pypi dist/*
   fi
   if [[ "$SMOKE_TESTPYPI" -eq 1 ]]; then
     TMP_VENV="$(mktemp -d)"
@@ -204,10 +230,10 @@ fi
 python -m twine check dist/*
 
 if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
-  python -m twine upload -r testpypi dist/*
+  python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
 fi
 if [[ "$UPLOAD_PYPI" -eq 1 ]]; then
-  python -m twine upload -r pypi dist/*
+  python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r pypi dist/*
 fi
 
 if [[ "$SMOKE_TESTPYPI" -eq 1 ]]; then
