@@ -12,7 +12,7 @@ UPLOAD_ONLY=0
 usage() {
   cat <<'EOF'
 Usage:
-  bash release_mlx.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only]
+  bash release.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only]
 
 Options:
   --upload-testpypi   Upload dist/* to TestPyPI via ~/.pypirc (repo: testpypi)
@@ -109,8 +109,8 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
     python -m venv "${TMP_VENV}/venv"
     # shellcheck disable=SC1091
     source "${TMP_VENV}/venv/bin/activate"
-    pip install -q -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "mujoco-mlx==${VERSION}"
-    python -c "import mujoco; from mujoco import mlx_step; print(mujoco.__version__, mlx_step.__name__)"
+    pip install -q -i https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple "mujoco-uni==${VERSION}"
+    python -c "import mujoco; print(mujoco.__version__)"
     deactivate 2>/dev/null; rm -rf "${TMP_VENV}"
   fi
   echo "[done] upload completed"
@@ -218,8 +218,8 @@ if [[ "$SMOKE_TESTPYPI" -eq 1 ]]; then
   pip install --upgrade pip
   pip install -i https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple \
-    "mujoco-mlx==${VERSION}"
-  python -c "import mujoco; from mujoco import mlx_step; print(mujoco.__version__, mlx_step.__name__)"
+    "mujoco-uni==${VERSION}"
+  python -c "import mujoco; print(mujoco.__version__)"
   deactivate
   rm -rf "${TMP_VENV_DIR}"
 fi

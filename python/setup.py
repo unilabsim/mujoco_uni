@@ -217,9 +217,11 @@ class BuildCMakeExtension(build_ext.build_ext):
     for directory, _, filenames in os.walk(self._mujoco_source_root):
       for pattern in get_external_lib_patterns():
         for filename in fnmatch.filter(filenames, pattern):
-          shutil.copyfile(
-              os.path.join(directory, filename), os.path.join(dst, filename)
-          )
+          src_path = os.path.join(directory, filename)
+          dst_path = os.path.join(dst, filename)
+          if os.path.abspath(src_path) == os.path.abspath(dst_path):
+            continue
+          shutil.copyfile(src_path, dst_path)
 
   def _copy_plugin_libraries(self):
     dst = os.path.join(
@@ -232,9 +234,11 @@ class BuildCMakeExtension(build_ext.build_ext):
     for directory, _, filenames in os.walk(self._mujoco_plugins_path):
       for pattern in get_plugin_lib_patterns():
         for filename in fnmatch.filter(filenames, pattern):
-          shutil.copyfile(
-              os.path.join(directory, filename), os.path.join(dst, filename)
-          )
+          src_path = os.path.join(directory, filename)
+          dst_path = os.path.join(dst, filename)
+          if os.path.abspath(src_path) == os.path.abspath(dst_path):
+            continue
+          shutil.copyfile(src_path, dst_path)
 
   def _copy_mujoco_headers(self):
     dst = os.path.join(
@@ -244,9 +248,11 @@ class BuildCMakeExtension(build_ext.build_ext):
     os.makedirs(dst, exist_ok=True)
     for directory, _, filenames in os.walk(self._mujoco_include_path):
       for filename in fnmatch.filter(filenames, '*.h'):
-        shutil.copyfile(
-            os.path.join(directory, filename), os.path.join(dst, filename)
-        )
+        src_path = os.path.join(directory, filename)
+        dst_path = os.path.join(dst, filename)
+        if os.path.abspath(src_path) == os.path.abspath(dst_path):
+          continue
+        shutil.copyfile(src_path, dst_path)
 
   def _copy_mjpython(self):
     src_dir = os.path.join(os.path.dirname(__file__), 'mujoco/mjpython')
@@ -394,7 +400,7 @@ setuptools.setup(
         CMakeExtension('mujoco._functions'),
         CMakeExtension('mujoco._render'),
         CMakeExtension('mujoco._rollout'),
-        CMakeExtension('mujoco._mlx_step'),
+        CMakeExtension('mujoco._batch_forward'),
         CMakeExtension('mujoco._simulate'),
         CMakeExtension('mujoco._specs'),
         CMakeExtension('mujoco._structs'),

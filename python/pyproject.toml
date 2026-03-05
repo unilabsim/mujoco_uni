@@ -3,12 +3,12 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco-mlx"
-version = "3.5.0.post6"
+name = "mujoco-uni"
+version = "3.5.0.post2"
 authors = [
     {name = "TATP-233"},
 ]
-description = "MuJoCo Physics Simulator with MLX rollout support for macOS"
+description = "MuJoCo Physics Simulator (Uni distribution) for macOS"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 classifiers = [
@@ -29,7 +29,6 @@ dependencies = [
     "absl-py",
     "etils[epath]",
     "glfw",
-    "mlx; platform_system == 'Darwin'",
     "numpy",
     "pyopengl",
 ]
