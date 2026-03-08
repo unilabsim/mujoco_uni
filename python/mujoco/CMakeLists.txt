@@ -92,8 +92,27 @@ if(NOT TARGET mujoco)
 
   if(NOT MUJOCO_FRAMEWORK)
     find_library(
-      MUJOCO_LIBRARY mujoco mujoco.3.5.0 HINTS ${MUJOCO_LIBRARY_DIR} REQUIRED
+      MUJOCO_LIBRARY NAMES mujoco HINTS ${MUJOCO_LIBRARY_DIR}
     )
+    if(NOT MUJOCO_LIBRARY)
+      file(
+        GLOB MUJOCO_LIBRARY_CANDIDATES
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.so"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.so.*"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.dylib"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.*.dylib"
+      )
+      if(MUJOCO_LIBRARY_CANDIDATES)
+        list(SORT MUJOCO_LIBRARY_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+        list(GET MUJOCO_LIBRARY_CANDIDATES 0 MUJOCO_LIBRARY)
+      endif()
+    endif()
+    if(NOT MUJOCO_LIBRARY)
+      message(
+        FATAL_ERROR
+        "Could not find MuJoCo shared library under MUJOCO_LIBRARY_DIR='${MUJOCO_LIBRARY_DIR}'"
+      )
+    endif()
     find_path(MUJOCO_INCLUDE mujoco/mujoco.h HINTS ${MUJOCO_INCLUDE_DIR} REQUIRED)
     message("MuJoCo is at ${MUJOCO_LIBRARY}")
     message("MuJoCo headers are at ${MUJOCO_INCLUDE}")

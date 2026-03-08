@@ -104,6 +104,32 @@ get_version() {
   awk -F'"' '/^version = / {print $2; exit}' pyproject.toml
 }
 
+retag_linux_wheels_for_upload() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+
+  shopt -s nullglob
+  local wheel_file
+  local retagged=0
+  for wheel_file in "$ROOT_DIR"/dist/*-linux_*.whl; do
+    local manylinux_tag
+    manylinux_tag="$(python -m auditwheel show "$wheel_file" 2>/dev/null | sed -n 's/.*constrains the platform tag to "\(manylinux_[^"]*\)".*/\1/p' | head -n1)"
+    if [[ -z "$manylinux_tag" ]]; then
+      continue
+    fi
+    echo "[info] retag wheel for index compatibility: $(basename "$wheel_file") -> ${manylinux_tag}"
+    python -m wheel tags --platform-tag "$manylinux_tag" --remove "$wheel_file" >/dev/null
+    retagged=1
+  done
+  shopt -u nullglob
+
+  if [[ "$retagged" -eq 1 ]]; then
+    echo "[info] refreshed dist/ after Linux wheel retagging"
+    ls -1 "$ROOT_DIR"/dist
+  fi
+}
+
 activate_conda_env
 cd "$ROOT_DIR"
 
@@ -122,7 +148,8 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
     echo "[error] dist/ is empty, run full build first" >&2
     exit 1
   fi
-  python -m pip install -q twine 2>/dev/null || true
+  python -m pip install -q twine wheel auditwheel 2>/dev/null || true
+  retag_linux_wheels_for_upload
   python -m twine check dist/*
   if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
     python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
@@ -143,7 +170,7 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-python -m pip install --upgrade build twine
+python -m pip install --upgrade build twine wheel auditwheel
 
 pip install --force-reinstall --no-deps "mujoco==${UPSTREAM_VERSION}"
 # Get installed mujoco path (avoid picking up local project copy)
@@ -228,6 +255,8 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
 fi
 
 python -m twine check dist/*
+
+retag_linux_wheels_for_upload
 
 if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
   python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
