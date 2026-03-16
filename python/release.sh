@@ -19,7 +19,7 @@ Options:
   --upload-testpypi   Upload dist/* to TestPyPI via ~/.pypirc (repo: testpypi)
   --upload-pypi       Upload dist/* to official PyPI via ~/.pypirc (repo: pypi)
   --smoke-testpypi    After upload, install from TestPyPI in a clean venv and smoke test
-  --build-all-python  Build wheels for Python 3.9, 3.10, 3.11, 3.12 via conda (avoids local compile for users)
+  --build-all-python  Build wheels for Python 3.9, 3.10, 3.11, 3.12, 3.13 via conda (avoids local compile for users)
   --upload-only       Skip build, only upload existing dist/* (use when build succeeded but upload failed)
   --skip-existing     Pass --skip-existing to twine upload (ignore files already on index)
 EOF
@@ -216,7 +216,7 @@ python -m build --sdist
 python -m build --wheel --no-isolation
 
 # Build wheels for other Python versions: PATH binaries first, then conda if --build-all-python
-for py in python3.9 python3.10 python3.11 python3.12; do
+for py in python3.9 python3.10 python3.11 python3.12 python3.13; do
   if command -v "$py" &>/dev/null && [[ "$("$py" -c 'import sys; print(sys.executable)' 2>/dev/null)" != "$(python -c 'import sys; print(sys.executable)' 2>/dev/null)" ]]; then
     echo "[info] building wheel for $("$py" --version 2>&1)"
     MUJOCO_PATH="${MUJOCO_SITE}" MUJOCO_PLUGIN_PATH="${MUJOCO_SITE}/plugin" \
@@ -224,7 +224,7 @@ for py in python3.9 python3.10 python3.11 python3.12; do
   fi
 done
 
-# Build wheels for Python 3.9, 3.10, 3.11, 3.12 via conda (so users get pre-built wheels, no compile)
+# Build wheels for Python 3.9, 3.10, 3.11, 3.12, 3.13 via conda (so users get pre-built wheels, no compile)
 if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
   conda_init_script=""
   [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]] && conda_init_script="$HOME/anaconda3/etc/profile.d/conda.sh"
@@ -235,7 +235,7 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
     # shellcheck disable=SC1090
     source "$conda_init_script"
     CURRENT_PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
-    for pyver in 3.9 3.10 3.11 3.12; do
+    for pyver in 3.9 3.10 3.11 3.12 3.13; do
       if [[ "$pyver" == "$CURRENT_PY_VER" ]]; then
         echo "[info] Python $pyver wheel already built (current env)"
         continue
