@@ -3,14 +3,14 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mujoco"
-version = "3.8.0"
+name = "mujoco-uni"
+version = "3.6.0"
 authors = [
-    {name = "Google DeepMind", email = "mujoco@deepmind.com"},
+    {name = "TATP-233"},
 ]
-description = "MuJoCo Physics Simulator"
+description = "MuJoCo Physics Simulator (Uni distribution)"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -21,7 +21,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
@@ -34,10 +33,10 @@ dependencies = [
 dynamic = ["readme", "scripts"]
 
 [project.urls]
-Homepage = "https://github.com/google-deepmind/mujoco"
-Documentation = "https://mujoco.readthedocs.io/en/3.8.0"
-Repository = "https://github.com/google-deepmind/mujoco"
-Changelog = "https://mujoco.readthedocs.io/en/3.8.0/changelog.html"
+Homepage = "https://github.com/TATP-233/mujoco"
+Documentation = "https://mujoco.readthedocs.io/en/3.6.0"
+Repository = "https://github.com/TATP-233/mujoco"
+Changelog = "https://mujoco.readthedocs.io/en/3.6.0/changelog.html"
 
 [tool.setuptools]
 include-package-data = false
