@@ -19,6 +19,12 @@
 build/
 build_cmake/
 python/dist/
+python/mujoco/enum_traits.h
+python/mujoco/function_traits.h
+python/mujoco/specs.cc.inc
+python/mujoco/include/
+python/mujoco/plugin/
+python/mujoco/MuJoCo_(mjpython).app/
 doc/_build
 
 # Exclude macOS folder attributes
@@ -41,4 +47,3 @@ MUJOCO_LOG.TXT
 # JavaScript bindings build
 wasm/**/dist/
 **/node_modules/
-
