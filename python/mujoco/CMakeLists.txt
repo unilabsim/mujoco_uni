@@ -94,8 +94,27 @@ if(NOT TARGET mujoco)
 
   if(NOT MUJOCO_FRAMEWORK)
     find_library(
-      MUJOCO_LIBRARY mujoco mujoco.3.7.0 HINTS ${MUJOCO_LIBRARY_DIR} REQUIRED
+      MUJOCO_LIBRARY NAMES mujoco HINTS ${MUJOCO_LIBRARY_DIR}
     )
+    if(NOT MUJOCO_LIBRARY)
+      file(
+        GLOB MUJOCO_LIBRARY_CANDIDATES
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.so"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.so.*"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.dylib"
+        "${MUJOCO_LIBRARY_DIR}/libmujoco.*.dylib"
+      )
+      if(MUJOCO_LIBRARY_CANDIDATES)
+        list(SORT MUJOCO_LIBRARY_CANDIDATES COMPARE NATURAL ORDER DESCENDING)
+        list(GET MUJOCO_LIBRARY_CANDIDATES 0 MUJOCO_LIBRARY)
+      endif()
+    endif()
+    if(NOT MUJOCO_LIBRARY)
+      message(
+        FATAL_ERROR
+        "Could not find MuJoCo shared library under MUJOCO_LIBRARY_DIR='${MUJOCO_LIBRARY_DIR}'"
+      )
+    endif()
     find_path(MUJOCO_INCLUDE mujoco/mujoco.h HINTS ${MUJOCO_INCLUDE_DIR} REQUIRED)
     message("MuJoCo is at ${MUJOCO_LIBRARY}")
     message("MuJoCo headers are at ${MUJOCO_INCLUDE}")
@@ -202,7 +221,13 @@ findorfetch(
 # ==================== MUJOCO PYTHON BINDINGS ==================================
 set(SIMULATE_BUILD_EXECUTABLE OFF)
 set(SIMULATE_GLFW_DYNAMIC_SYMBOLS ON)
-add_subdirectory(simulate)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/simulate/CMakeLists.txt")
+  add_subdirectory(simulate)
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../simulate/CMakeLists.txt")
+  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../simulate" simulate)
+else()
+  message(FATAL_ERROR "Could not find simulate/ CMake project")
+endif()
 
 add_subdirectory(util)
 
@@ -217,7 +242,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/enum_traits.h)
 else()
   add_custom_command(
     OUTPUT enum_traits.h
-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python/mujoco ${Python3_EXECUTABLE}
+    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_enum_traits.py > enum_traits.h
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_enum_traits.py
   )
@@ -235,7 +260,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/function_traits.h)
 else()
   add_custom_command(
     OUTPUT function_traits.h
-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python/mujoco ${Python3_EXECUTABLE}
+    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_function_traits.py > function_traits.h
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_function_traits.py
   )
@@ -407,6 +432,9 @@ target_link_libraries(
 mujoco_pybind11_module(_rollout rollout.cc threadpool.cc)
 target_link_libraries(_rollout PRIVATE functions_header mujoco raw)
 
+mujoco_pybind11_module(_batch_forward batch_forward_bind.cc threadpool.cc)
+target_link_libraries(_batch_forward PRIVATE functions_header mujoco raw)
+
 mujoco_pybind11_module(
   _structs
   indexers.cc
@@ -430,7 +458,7 @@ target_link_libraries(
 if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/specs.cc.inc)
   add_custom_command(
     OUTPUT specs.cc.inc
-    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${mujoco_SOURCE_DIR}/mujoco/python ${Python3_EXECUTABLE}
+    COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR} ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_spec_bindings.py > specs.cc.inc
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/codegen/generate_spec_bindings.py
   )
@@ -471,6 +499,7 @@ set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_functions>"
     "$<TARGET_FILE:_render>"
     "$<TARGET_FILE:_rollout>"
+    "$<TARGET_FILE:_batch_forward>"
     "$<TARGET_FILE:_simulate>"
     "$<TARGET_FILE:_specs>"
     "$<TARGET_FILE:_structs>"
@@ -507,6 +536,7 @@ if(MUJOCO_PYTHON_MAKE_WHEEL)
     _functions
     _render
     _rollout
+    _batch_forward
     _simulate
     _specs
     _structs
