@@ -435,6 +435,11 @@ target_link_libraries(_rollout PRIVATE functions_header mujoco raw)
 mujoco_pybind11_module(_batch_forward batch_forward_bind.cc threadpool.cc)
 target_link_libraries(_batch_forward PRIVATE functions_header mujoco raw)
 
+mujoco_pybind11_module(_domain_randomized_rollout
+                       domain_randomized_rollout.cc threadpool.cc)
+target_link_libraries(_domain_randomized_rollout
+                      PRIVATE functions_header mujoco raw)
+
 mujoco_pybind11_module(
   _structs
   indexers.cc
@@ -500,6 +505,7 @@ set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_render>"
     "$<TARGET_FILE:_rollout>"
     "$<TARGET_FILE:_batch_forward>"
+    "$<TARGET_FILE:_domain_randomized_rollout>"
     "$<TARGET_FILE:_simulate>"
     "$<TARGET_FILE:_specs>"
     "$<TARGET_FILE:_structs>"
@@ -537,6 +543,7 @@ if(MUJOCO_PYTHON_MAKE_WHEEL)
     _render
     _rollout
     _batch_forward
+    _domain_randomized_rollout
     _simulate
     _specs
     _structs
