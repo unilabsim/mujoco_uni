@@ -12,11 +12,14 @@ SKIP_EXISTING=0
 WHEEL_ONLY=0
 SDIST_ONLY=0
 NO_AUTO_CONDA=0
+MANYLINUX_2_28=0
+CONTAINER_RUNTIME=""
+CONTAINER_ARCH="auto"
 
 usage() {
   cat <<'EOF'
 Usage:
-  bash release.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only] [--skip-existing] [--wheel-only] [--sdist-only] [--no-auto-conda]
+  bash release.sh [--upload-testpypi] [--upload-pypi] [--smoke-testpypi] [--build-all-python] [--upload-only] [--skip-existing] [--wheel-only] [--sdist-only] [--no-auto-conda] [--manylinux-2-28] [--container-runtime docker|podman] [--container-arch x86_64|aarch64]
 
 Options:
   --upload-testpypi   Upload dist/* to TestPyPI via ~/.pypirc (repo: testpypi)
@@ -28,6 +31,14 @@ Options:
   --wheel-only        Build wheel only (skip sdist)
   --sdist-only        Build sdist only (skip wheel)
   --no-auto-conda     Use the current Python environment instead of auto-activating conda
+  --manylinux-2-28    Build Linux wheel in a manylinux_2_28 container
+  --container-runtime Container runtime used with --manylinux-2-28 (docker or podman)
+  --container-arch    Container architecture used with --manylinux-2-28 (default: auto)
+
+Linux note:
+  Building on a recent host distro sets the wheel's real glibc floor to that
+  host (for example Ubuntu 24.04 -> manylinux_2_39). If you need Ubuntu 22.04
+  compatibility, pass --manylinux-2-28.
 EOF
 }
 
@@ -69,6 +80,18 @@ while [[ $# -gt 0 ]]; do
       NO_AUTO_CONDA=1
       shift
       ;;
+    --manylinux-2-28)
+      MANYLINUX_2_28=1
+      shift
+      ;;
+    --container-runtime)
+      CONTAINER_RUNTIME="${2:-}"
+      shift 2
+      ;;
+    --container-arch)
+      CONTAINER_ARCH="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -85,6 +108,47 @@ if [[ "$WHEEL_ONLY" -eq 1 && "$SDIST_ONLY" -eq 1 ]]; then
   echo "[error] --wheel-only and --sdist-only are mutually exclusive" >&2
   exit 1
 fi
+
+run_manylinux_2_28_wheel_build() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "[error] --manylinux-2-28 is only supported on Linux hosts" >&2
+    exit 1
+  fi
+
+  local helper_args=()
+  local current_pyver=""
+
+  if [[ -n "$CONTAINER_RUNTIME" ]]; then
+    helper_args+=(--runtime "$CONTAINER_RUNTIME")
+  fi
+  if [[ "$CONTAINER_ARCH" != "auto" ]]; then
+    helper_args+=(--arch "$CONTAINER_ARCH")
+  fi
+  if [[ "$BUILD_ALL_PYTHON" -eq 0 ]]; then
+    current_pyver="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    helper_args+=(--python "$current_pyver")
+  fi
+
+  bash "${ROOT_DIR}/build_manylinux_2_28.sh" "${helper_args[@]}"
+}
+
+prepare_manylinux_2_28_workspace() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "[error] --manylinux-2-28 is only supported on Linux hosts" >&2
+    exit 1
+  fi
+
+  local helper_args=(--fix-permissions-only)
+
+  if [[ -n "$CONTAINER_RUNTIME" ]]; then
+    helper_args+=(--runtime "$CONTAINER_RUNTIME")
+  fi
+  if [[ "$CONTAINER_ARCH" != "auto" ]]; then
+    helper_args+=(--arch "$CONTAINER_ARCH")
+  fi
+
+  bash "${ROOT_DIR}/build_manylinux_2_28.sh" "${helper_args[@]}"
+}
 
 activate_conda_env() {
   local conda_init_script=""
@@ -172,6 +236,36 @@ get_upstream_version() {
   printf '%s\n' "$1" | cut -d. -f1-3
 }
 
+get_installed_mujoco_site() {
+  python -c 'from importlib.metadata import distribution; import pathlib; print(pathlib.Path(distribution("mujoco").locate_file("mujoco")).resolve())'
+}
+
+manylinux_tag_is_compatible_with_2_28() {
+  local tag="${1:-}"
+  if [[ -z "$tag" ]]; then
+    return 0
+  fi
+
+  case "$tag" in
+    manylinux2014|manylinux2014_*|manylinux_2_17|manylinux_2_17_*|manylinux_2_24|manylinux_2_24_*|manylinux_2_27|manylinux_2_27_*|manylinux_2_28|manylinux_2_28_*)
+      return 0
+      ;;
+    manylinux_*)
+      if [[ "$tag" =~ ^manylinux_([0-9]+)_([0-9]+)(_|$) ]]; then
+        local major="${BASH_REMATCH[1]}"
+        local minor="${BASH_REMATCH[2]}"
+        if (( major < 2 || (major == 2 && minor <= 28) )); then
+          return 0
+        fi
+      fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 retag_linux_wheels_for_upload() {
   if [[ "$(uname -s)" != "Linux" ]]; then
     return 0
@@ -210,10 +304,41 @@ upload_dist_with_twine() {
   "${cmd[@]}"
 }
 
+validate_linux_wheels_platform_floor() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+
+  shopt -s nullglob
+  local wheel_file
+  local incompatible=0
+  for wheel_file in "$ROOT_DIR"/dist/*.whl; do
+    local manylinux_tag
+    manylinux_tag="$(python -m auditwheel show "$wheel_file" 2>/dev/null | sed -n 's/.*constrains the platform tag to "\(manylinux_[^"]*\)".*/\1/p' | head -n1)"
+    if [[ -z "$manylinux_tag" ]]; then
+      continue
+    fi
+    if ! manylinux_tag_is_compatible_with_2_28 "$manylinux_tag"; then
+      echo "[error] incompatible Linux wheel detected: $(basename "$wheel_file") requires ${manylinux_tag}" >&2
+      echo "[error] build Linux wheels inside python/build_manylinux_2_28.sh to target Ubuntu 22.04 / manylinux_2_28" >&2
+      incompatible=1
+    fi
+  done
+  shopt -u nullglob
+
+  if [[ "$incompatible" -eq 1 ]]; then
+    exit 1
+  fi
+}
+
 cleanup_bundled_assets() {
   local bundle_dir="${ROOT_DIR}/mujoco"
   rm -rf "${bundle_dir}/include" "${bundle_dir}/plugin" "${bundle_dir}/cmake" "${bundle_dir}/simulate"
   rm -f "${bundle_dir}"/libmujoco*.dylib "${bundle_dir}"/libmujoco*.so*
+}
+
+build_sdist_artifact() {
+  python -m build --sdist
 }
 
 if [[ "$NO_AUTO_CONDA" -eq 0 ]]; then
@@ -240,6 +365,7 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
     python -m pip install -q auditwheel 2>/dev/null || true
   fi
   retag_linux_wheels_for_upload
+  validate_linux_wheels_platform_floor
   python -m twine check dist/*
   if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
     upload_dist_with_twine testpypi
@@ -261,13 +387,13 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-python -m pip install --upgrade build twine wheel absl-py
+python -m pip install --upgrade build setuptools twine wheel absl-py
 if [[ "$(uname -s)" == "Linux" ]]; then
   python -m pip install --upgrade auditwheel
 fi
 
 pip install --force-reinstall --no-deps "mujoco==${UPSTREAM_VERSION}"
-MUJOCO_SITE="$(pip show mujoco | awk -F': ' '/^Location:/ {print $2"/mujoco"; exit}')"
+MUJOCO_SITE="$(get_installed_mujoco_site)"
 
 export MUJOCO_PATH="${MUJOCO_SITE}"
 export MUJOCO_PLUGIN_PATH="${MUJOCO_SITE}/plugin"
@@ -300,16 +426,29 @@ PYTHONPATH="${ROOT_DIR}/mujoco" \
 python "${ROOT_DIR}/mujoco/codegen/generate_spec_bindings.py" \
   > "${ROOT_DIR}/mujoco/specs.cc.inc"
 
+if [[ "$MANYLINUX_2_28" -eq 1 ]]; then
+  prepare_manylinux_2_28_workspace
+fi
+
 rm -rf dist build ./*.egg-info
-if [[ "$WHEEL_ONLY" -eq 0 ]]; then
-  python -m build --sdist
+
+if [[ "$MANYLINUX_2_28" -eq 1 ]]; then
+  if [[ "$SDIST_ONLY" -eq 0 ]]; then
+    run_manylinux_2_28_wheel_build
+  fi
+  if [[ "$WHEEL_ONLY" -eq 0 ]]; then
+    build_sdist_artifact
+  fi
+else
+  if [[ "$WHEEL_ONLY" -eq 0 ]]; then
+    build_sdist_artifact
+  fi
+  if [[ "$SDIST_ONLY" -eq 0 ]]; then
+    python -m build --wheel --no-isolation
+  fi
 fi
 
-if [[ "$SDIST_ONLY" -eq 0 ]]; then
-  python -m build --wheel --no-isolation
-fi
-
-if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
+if [[ "$BUILD_ALL_PYTHON" -eq 1 && "$MANYLINUX_2_28" -eq 0 ]]; then
   conda_init_script=""
   [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]] && conda_init_script="$HOME/anaconda3/etc/profile.d/conda.sh"
   [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]] && conda_init_script="$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -347,8 +486,8 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
         export _PYTHON_HOST_PLATFORM='${_PYTHON_HOST_PLATFORM:-}'
         export ARCHFLAGS='${ARCHFLAGS:-}'
         export MUJOCO_CMAKE_ARGS='${MUJOCO_CMAKE_ARGS:-}'
-        pip install -q 'mujoco==${UPSTREAM_VERSION}' build absl-py
-        MUJOCO_SITE=\$(pip show mujoco | awk -F': ' '/^Location:/ {print \$2\"/mujoco\"; exit}')
+        pip install -q 'mujoco==${UPSTREAM_VERSION}' build setuptools absl-py
+        MUJOCO_SITE=\$(python -c 'from importlib.metadata import distribution; import pathlib; print(pathlib.Path(distribution(\"mujoco\").locate_file(\"mujoco\")).resolve())')
         export MUJOCO_PATH=\$MUJOCO_SITE
         export MUJOCO_PLUGIN_PATH=\$MUJOCO_SITE/plugin
         cd '${ROOT_DIR}' && python -m build --wheel --no-isolation
@@ -357,9 +496,9 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
   fi
 fi
 
-python -m twine check dist/*
-
 retag_linux_wheels_for_upload
+validate_linux_wheels_platform_floor
+python -m twine check dist/*
 
 if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
   upload_dist_with_twine testpypi
