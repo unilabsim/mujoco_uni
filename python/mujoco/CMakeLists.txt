@@ -153,7 +153,7 @@ endif()
 set(MUJOCO_PYTHON_ABSL_TARGETS absl::core_headers absl::flat_hash_map absl::span)
 findorfetch(
   USE_SYSTEM_PACKAGE
-  OFF
+  ON
   PACKAGE_NAME
   absl
   LIBRARY_NAME
@@ -186,7 +186,7 @@ endforeach()
 add_compile_definitions(EIGEN_MPL2_ONLY)
 findorfetch(
   USE_SYSTEM_PACKAGE
-  OFF
+  ON
   PACKAGE_NAME
   Eigen3
   LIBRARY_NAME
@@ -219,14 +219,17 @@ findorfetch(
 )
 
 # ==================== MUJOCO PYTHON BINDINGS ==================================
+option(MUJOCO_PYTHON_BUILD_SIMULATE "Build simulate-backed Python bindings." ON)
 set(SIMULATE_BUILD_EXECUTABLE OFF)
 set(SIMULATE_GLFW_DYNAMIC_SYMBOLS ON)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/simulate/CMakeLists.txt")
-  add_subdirectory(simulate)
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../simulate/CMakeLists.txt")
-  add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../simulate" simulate)
-else()
-  message(FATAL_ERROR "Could not find simulate/ CMake project")
+if(MUJOCO_PYTHON_BUILD_SIMULATE)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/simulate/CMakeLists.txt")
+    add_subdirectory(simulate)
+  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../simulate/CMakeLists.txt")
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../../simulate" simulate)
+  else()
+    message(FATAL_ERROR "Could not find simulate/ CMake project")
+  endif()
 endif()
 
 add_subdirectory(util)
@@ -480,16 +483,18 @@ target_link_libraries(
           structs_header
 )
 
-mujoco_pybind11_module(_simulate simulate.cc)
-target_link_libraries(
-  _simulate
-  PRIVATE mujoco
-          mujoco::libmujoco_simulate
-          glfw
-          errors_header
-          raw
-          structs_header
-)
+if(MUJOCO_PYTHON_BUILD_SIMULATE)
+  mujoco_pybind11_module(_simulate simulate.cc)
+  target_link_libraries(
+    _simulate
+    PRIVATE mujoco
+            mujoco::libmujoco_simulate
+            glfw
+            errors_header
+            raw
+            structs_header
+  )
+endif()
 
 set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_callbacks>"
@@ -500,11 +505,13 @@ set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_render>"
     "$<TARGET_FILE:_rollout>"
     "$<TARGET_FILE:_batch_env>"
-    "$<TARGET_FILE:_simulate>"
     "$<TARGET_FILE:_specs>"
     "$<TARGET_FILE:_structs>"
     "$<TARGET_FILE:mujoco>"
 )
+if(MUJOCO_PYTHON_BUILD_SIMULATE)
+  list(APPEND LIBRARIES_FOR_WHEEL "$<TARGET_FILE:_simulate>")
+endif()
 
 if(APPLE)
   add_executable(mjpython mjpython/mjpython.mm)
@@ -537,11 +544,13 @@ if(MUJOCO_PYTHON_MAKE_WHEEL)
     _render
     _rollout
     _batch_env
-    _simulate
     _specs
     _structs
     mujoco
   )
+  if(MUJOCO_PYTHON_BUILD_SIMULATE)
+    add_dependencies(wheel _simulate)
+  endif()
   if(APPLE)
     add_dependencies(wheel mjpython)
   endif()
