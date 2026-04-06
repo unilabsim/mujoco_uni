@@ -14,7 +14,7 @@ It exposes three execution primitives:
     (``(nbatch, nstate)`` / ``(nbatch, nsensordata)``), not trajectories.
 
   * :meth:`BatchEnvPool.forward` — single ``mj_forward`` over all envs.
-    Replaces the old ``mujoco.batch_forward`` module.
+    Returns only ``sensordata``.
 
   * :meth:`BatchEnvPool.reset` — fused sparse reset over a subset of
     envs with optional per-env model field patching and selective
@@ -158,8 +158,7 @@ class BatchEnvPool:
       chunk_size: thread-pool chunk size, optional.
 
     Returns:
-      ``(state, sensordata)`` with shapes ``(nbatch, nstate)`` and
-      ``(nbatch, nsensordata)``.
+      ``sensordata`` array with shape ``(nbatch, nsensordata)``.
     """
     if self._pool is None:
       raise RuntimeError("forward requested after pool close")
