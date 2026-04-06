@@ -1,26 +1,26 @@
-"""Persistent executor for reset-lifecycle domain-randomized rollouts.
+"""Batched environment pool backed by a persistent per-env mjModel pool.
 
-This module wraps the pybind-backed ``_dr_rollout`` pool. The
-pool owns:
-  * a per-environment ``mjModel`` pool (cloned from a caller-supplied base
+This module wraps the pybind-backed ``_batch_env`` C++ module. The pool
+owns:
+  * ``nbatch`` ``mjModel`` instances (cloned from a caller-supplied base
     model via ``mj_copyModel``),
-  * a per-thread ``mjData`` worker pool,
+  * per-thread ``mjData`` workers,
   * an internal thread pool.
 
-It exposes two execution primitives:
+It exposes three execution primitives:
 
-  * :meth:`DomainRandomizedRolloutPool.rollout` — full-batch stepping
-    equivalent to :func:`mujoco.rollout.rollout` but running on the owned
-    model pool.
+  * :meth:`BatchEnvPool.step` — multi-step ``mj_step`` over the full
+    env pool. Returns only the **final** state and sensordata
+    (``(nbatch, nstate)`` / ``(nbatch, nsensordata)``), not trajectories.
 
-  * :meth:`DomainRandomizedRolloutPool.reset_subset` — fused sparse reset:
-    apply per-environment ``mjModel`` field patches (e.g. ``body_mass``),
-    optionally refresh derived constants via ``mj_setConst``, then run
-    ``mj_forward`` and return state + sensor outputs for the subset only.
+  * :meth:`BatchEnvPool.forward` — single ``mj_forward`` over all envs.
+    Replaces the old ``mujoco.batch_forward`` module.
 
-Supported randomization fields for the first iteration are listed in
-``SUPPORTED_FIELDS``. Fields ``body_mass``, ``body_ipos``, ``dof_armature``
-trigger ``mj_setConst`` refresh; ``geom_friction``, ``dof_damping`` do not.
+  * :meth:`BatchEnvPool.reset` — fused sparse reset over a subset of
+    envs with optional per-env model field patching and selective
+    ``mj_setConst`` refresh.
+
+Supported randomization fields are listed in ``SUPPORTED_FIELDS``.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 import mujoco
-from mujoco import _dr_rollout as _native
+from mujoco import _batch_env as _native
 
 
 SUPPORTED_FIELDS = tuple(_native.SUPPORTED_FIELDS)
 
 
-class DomainRandomizedRolloutPool:
-  """Persistent per-environment model pool with sparse-reset execution."""
+class BatchEnvPool:
+  """Persistent per-environment model pool with step / forward / reset."""
 
   def __init__(
       self,
@@ -48,13 +48,11 @@ class DomainRandomizedRolloutPool:
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
     self._nthread = 0 if nthread is None else int(nthread)
-    self._pool = _native.DomainRandomizedRolloutPool(
+    self._pool = _native.BatchEnvPool(
         model=model, nbatch=int(nbatch), nthread=self._nthread
     )
 
-  # Context manager sugar. The C++ destructor cleans up, but explicit
-  # close() lets callers release native memory before GC.
-  def __enter__(self) -> "DomainRandomizedRolloutPool":
+  def __enter__(self) -> "BatchEnvPool":
     return self
 
   def __exit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -86,8 +84,8 @@ class DomainRandomizedRolloutPool:
   def nsensordata(self) -> int:
     return self._pool.nsensordata
 
-  # -- rollout --------------------------------------------------------
-  def rollout(
+  # -- step -----------------------------------------------------------
+  def step(
       self,
       initial_state,
       *,
@@ -95,29 +93,26 @@ class DomainRandomizedRolloutPool:
       control_spec: int = int(mujoco.mjtState.mjSTATE_CTRL),
       control=None,
       initial_warmstart=None,
-      state=None,
-      sensordata=None,
       chunk_size: Optional[int] = None,
   ):
     """Run ``nstep`` of ``mj_step`` on every environment.
 
+    Returns only the **final** state after all steps. Sensor computation
+    is skipped — use :meth:`forward` afterwards if you need sensors.
+
     Args:
       initial_state: ``(nbatch, nstate)`` full-physics initial states.
       nstep: number of steps.
-      control_spec: MuJoCo ``mjtState`` flags specifying what ``control``
-        contains.
+      control_spec: MuJoCo ``mjtState`` flags for control.
       control: ``(nbatch, nstep, ncontrol)`` control trajectories, optional.
       initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
-      state: preallocated ``(nbatch, nstep, nstate)`` state output, optional.
-      sensordata: preallocated ``(nbatch, nstep, nsensordata)``, optional.
       chunk_size: thread-pool chunk size, optional.
 
     Returns:
-      (state, sensordata) numpy arrays. If ``state``/``sensordata`` were
-      passed in they are returned unchanged.
+      ``state`` array with shape ``(nbatch, nstate)``.
     """
     if self._pool is None:
-      raise RuntimeError("rollout requested after pool close")
+      raise RuntimeError("step requested after pool close")
     if nstep < 1:
       raise ValueError("nstep must be >= 1")
 
@@ -127,47 +122,68 @@ class DomainRandomizedRolloutPool:
           f"initial_state must have shape (nbatch={self.nbatch}, nstate), "
           f"got {initial_state.shape}"
       )
-
-    nbatch = self.nbatch
-    nstate_ = self.nstate
-    nv_ = self.nv
-    nsensordata_ = self.nsensordata
-
     if control is not None:
       control = np.ascontiguousarray(control, dtype=np.float64)
     if initial_warmstart is not None:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-      if initial_warmstart.shape != (nbatch, nv_):
-        raise ValueError(
-            f"initial_warmstart must have shape ({nbatch}, {nv_}), "
-            f"got {initial_warmstart.shape}"
-        )
 
-    if state is None:
-      state = np.zeros((nbatch, nstep, nstate_), dtype=np.float64)
-    else:
-      state = np.ascontiguousarray(state, dtype=np.float64)
-    if sensordata is None:
-      sensordata = np.zeros((nbatch, nstep, nsensordata_), dtype=np.float64)
-    else:
-      sensordata = np.ascontiguousarray(sensordata, dtype=np.float64)
-
-    self._pool.rollout(
+    return self._pool.step(
         nstep=int(nstep),
         control_spec=int(control_spec),
         state0=initial_state,
         warmstart0=initial_warmstart,
         control=control,
-        state=state,
-        sensordata=sensordata,
         chunk_size=chunk_size,
     )
-    return state, sensordata
+
+  # -- forward --------------------------------------------------------
+  def forward(
+      self,
+      initial_state,
+      *,
+      initial_warmstart=None,
+      skipsensor: bool = False,
+      chunk_size: Optional[int] = None,
+  ):
+    """Run a single ``mj_forward`` on every environment.
+
+    Replaces the old ``mujoco.batch_forward`` module.
+
+    Args:
+      initial_state: ``(nbatch, nstate)`` full-physics states.
+      initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
+      skipsensor: skip sensor evaluation.
+      chunk_size: thread-pool chunk size, optional.
+
+    Returns:
+      ``(state, sensordata)`` with shapes ``(nbatch, nstate)`` and
+      ``(nbatch, nsensordata)``.
+    """
+    if self._pool is None:
+      raise RuntimeError("forward requested after pool close")
+
+    initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
+    if initial_state.ndim != 2 or initial_state.shape[0] != self.nbatch:
+      raise ValueError(
+          f"initial_state must have shape (nbatch={self.nbatch}, nstate), "
+          f"got {initial_state.shape}"
+      )
+    if initial_warmstart is not None:
+      initial_warmstart = np.ascontiguousarray(
+          initial_warmstart, dtype=np.float64
+      )
+
+    return self._pool.forward(
+        state0=initial_state,
+        warmstart0=initial_warmstart,
+        skipsensor=bool(skipsensor),
+        chunk_size=chunk_size,
+    )
 
   # -- sparse reset ---------------------------------------------------
-  def reset_subset(
+  def reset(
       self,
       env_ids: Sequence[int],
       initial_state,
@@ -180,24 +196,19 @@ class DomainRandomizedRolloutPool:
     """Reset a subset of environments, optionally applying field patches.
 
     Args:
-      env_ids: iterable of environment indices to reset.
+      env_ids: 1-D array of environment indices to reset.
       initial_state: ``(len(env_ids), nstate)`` full-physics states.
-      randomization: optional dict mapping field name (one of
-        ``SUPPORTED_FIELDS``) to a numpy array with leading dim
-        ``len(env_ids)`` and trailing size matching the field for this
-        model.
+      randomization: optional ``Dict[str, ndarray]`` mapping field name
+        to a payload with leading dim ``len(env_ids)``.
       initial_warmstart: optional ``(len(env_ids), nv)``.
-      skipsensor: skip sensor evaluation (see ``mj_forwardSkip``).
+      skipsensor: skip sensor evaluation.
       chunk_size: thread-pool chunk size, optional.
 
     Returns:
-      (state, sensordata) with leading dim ``len(env_ids)``. Rows are
-      indexed positionally by ``env_ids[k]``; the caller is responsible
-      for scattering them into a dense per-env buffer if desired
-      (``dense[env_ids] = subset``).
+      ``(state, sensordata)`` with leading dim ``len(env_ids)``.
     """
     if self._pool is None:
-      raise RuntimeError("reset_subset requested after pool close")
+      raise RuntimeError("reset requested after pool close")
 
     env_ids_arr = np.ascontiguousarray(env_ids, dtype=np.int32)
     if env_ids_arr.ndim != 1:
@@ -214,14 +225,7 @@ class DomainRandomizedRolloutPool:
       initial_warmstart = np.ascontiguousarray(
           initial_warmstart, dtype=np.float64
       )
-      if initial_warmstart.shape != (n, self.nv):
-        raise ValueError(
-            f"initial_warmstart must have shape ({n}, nv={self.nv}), "
-            f"got {initial_warmstart.shape}"
-        )
 
-    # Pre-validate randomization shapes in Python — the C++ side will also
-    # verify, but we want nicer error messages close to the caller.
     if randomization is not None:
       unknown = [k for k in randomization if k not in SUPPORTED_FIELDS]
       if unknown:
@@ -238,7 +242,7 @@ class DomainRandomizedRolloutPool:
           )
         randomization[key] = arr
 
-    return self._pool.reset_subset(
+    return self._pool.reset(
         env_ids=env_ids_arr,
         initial_state=initial_state,
         randomization=randomization,
@@ -249,10 +253,7 @@ class DomainRandomizedRolloutPool:
 
   # -- introspection for tests ---------------------------------------
   def get_field(self, env_id: int, name: str) -> np.ndarray:
-    """Return a flat copy of the given field for one environment.
-
-    Intended for tests and debugging.
-    """
+    """Return a flat copy of the given field for one environment."""
     if self._pool is None:
       raise RuntimeError("get_field requested after pool close")
     return self._pool.get_field(int(env_id), str(name))

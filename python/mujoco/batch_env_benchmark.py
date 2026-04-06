@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Benchmark for DomainRandomizedRolloutPool.
+"""Benchmark for BatchEnvPool.
 
 Covers:
   * full-batch rollout throughput vs mujoco.rollout.rollout
@@ -21,7 +21,7 @@ Covers:
   * memory footprint of the persistent model pool
 
 Usage:
-  python -m mujoco.dr_rollout_benchmark \
+  python -m mujoco.batch_env_benchmark \
       --nbatch 1024 --nthread 16 --nstep 100 --warmup 3 --repeat 10
 """
 
@@ -36,7 +36,7 @@ from typing import List
 import numpy as np
 
 import mujoco
-from mujoco import dr_rollout as drr
+from mujoco import batch_env
 from mujoco import rollout as stateless_rollout
 
 
@@ -96,11 +96,11 @@ def bench_full_rollout(model, nbatch, nthread, nstep, warmup, repeat, rng):
 
   t_ref = _time_it(ref_call, warmup, repeat)
 
-  with drr.DomainRandomizedRolloutPool(
+  with batch_env.BatchEnvPool(
       model, nbatch=nbatch, nthread=nthread
   ) as pool:
     def pool_call():
-      pool.rollout(
+      pool.step(
           state0,
           nstep=nstep,
           control_spec=int(mujoco.mjtState.mjSTATE_CTRL),
@@ -129,16 +129,16 @@ def bench_reset_subset_scan(model, nbatch, nthread, warmup, repeat, rng):
   nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
   nresets = sorted({1, 8, 64, nbatch})
 
-  with drr.DomainRandomizedRolloutPool(
+  with batch_env.BatchEnvPool(
       model, nbatch=nbatch, nthread=nthread
   ) as pool:
-    print(f"[reset_subset scan] nbatch={nbatch} nthread={nthread}")
+    print(f"[reset scan] nbatch={nbatch} nthread={nthread}")
     for nreset in nresets:
       env_ids = rng.choice(nbatch, size=nreset, replace=False).astype(np.int32)
       init = rng.standard_normal((nreset, nstate)).astype(np.float64)
 
       def call():
-        pool.reset_subset(env_ids, init)
+        pool.reset(env_ids, init)
       t = _time_it(call, warmup, repeat)
       print(
           f"  nreset={nreset:>5d}: {t*1e6:8.1f} us/call, "
@@ -150,7 +150,7 @@ def bench_patch_refresh(model, nbatch, nthread, warmup, repeat, rng):
   nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
   nreset = min(64, nbatch)
 
-  with drr.DomainRandomizedRolloutPool(
+  with batch_env.BatchEnvPool(
       model, nbatch=nbatch, nthread=nthread
   ) as pool:
     env_ids = rng.choice(nbatch, size=nreset, replace=False).astype(np.int32)
@@ -179,7 +179,7 @@ def bench_patch_refresh(model, nbatch, nthread, warmup, repeat, rng):
     )
     for label, rand in scenarios.items():
       def call():
-        pool.reset_subset(env_ids, init, randomization=rand)
+        pool.reset(env_ids, init, randomization=rand)
       t = _time_it(call, warmup, repeat)
       print(f"  {label:38s}: {t*1e6:8.1f} us/call")
 
