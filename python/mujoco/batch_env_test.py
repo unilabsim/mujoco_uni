@@ -168,11 +168,10 @@ class ForwardTest(parameterized.TestCase):
     with batch_env.BatchEnvPool(
         model, nbatch=nbatch, nthread=nthread
     ) as pool:
-      state, sensor = pool.forward(state0)
+      sensor = pool.forward(state0)
 
     for i in range(nbatch):
-      ref_state, ref_sensor = _reference_forward(model, state0[i])
-      np.testing.assert_allclose(state[i], ref_state, atol=1e-12, rtol=0)
+      _, ref_sensor = _reference_forward(model, state0[i])
       np.testing.assert_allclose(sensor[i], ref_sensor, atol=1e-12, rtol=0)
 
 
