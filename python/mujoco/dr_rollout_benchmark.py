@@ -21,7 +21,7 @@ Covers:
   * memory footprint of the persistent model pool
 
 Usage:
-  python -m mujoco.domain_randomized_rollout_benchmark \
+  python -m mujoco.dr_rollout_benchmark \
       --nbatch 1024 --nthread 16 --nstep 100 --warmup 3 --repeat 10
 """
 
@@ -36,7 +36,7 @@ from typing import List
 import numpy as np
 
 import mujoco
-from mujoco import domain_randomized_rollout as drr
+from mujoco import dr_rollout as drr
 from mujoco import rollout as stateless_rollout
 
 
