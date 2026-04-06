@@ -34,8 +34,23 @@ MUJOCO_CMAKE = 'MUJOCO_CMAKE'
 MUJOCO_CMAKE_ARGS = 'MUJOCO_CMAKE_ARGS'
 MUJOCO_PATH = 'MUJOCO_PATH'
 MUJOCO_PLUGIN_PATH = 'MUJOCO_PLUGIN_PATH'
+MUJOCO_PYTHON_EXTENSIONS = 'MUJOCO_PYTHON_EXTENSIONS'
 
 EXT_PREFIX = 'mujoco.'
+DEFAULT_EXTENSIONS = (
+    'mujoco._callbacks',
+    'mujoco._constants',
+    'mujoco._enums',
+    'mujoco._errors',
+    'mujoco._functions',
+    'mujoco._render',
+    'mujoco._rollout',
+    'mujoco._batch_env',
+    'mujoco._batch_forward',
+    'mujoco._simulate',
+    'mujoco._specs',
+    'mujoco._structs',
+)
 
 
 def get_long_description():
@@ -255,6 +270,9 @@ class BuildCMakeExtension(build_ext.build_ext):
 
   def _copy_mjpython(self):
     src_dir = os.path.join(os.path.dirname(__file__), 'mujoco/mjpython')
+    src_bin = os.path.join(self.build_temp, 'mjpython')
+    if not os.path.exists(src_bin):
+      return
     dst_contents_dir = os.path.join(
         os.path.dirname(self.get_ext_fullpath(self.extensions[0].name)),
         'MuJoCo_(mjpython).app/Contents',
@@ -268,7 +286,7 @@ class BuildCMakeExtension(build_ext.build_ext):
     dst_bin_dir = os.path.join(dst_contents_dir, 'MacOS')
     os.makedirs(dst_bin_dir, exist_ok=True)
     shutil.copyfile(
-        os.path.join(self.build_temp, 'mjpython'),
+        src_bin,
         os.path.join(dst_bin_dir, 'mjpython'),
     )
     os.chmod(os.path.join(dst_bin_dir, 'mjpython'), 0o755)
@@ -339,9 +357,12 @@ class BuildCMakeExtension(build_ext.build_ext):
         cwd=self.build_temp,
     )
 
-    print('Building all extensions with CMake')
+    target_names = [ext.name[len(EXT_PREFIX) :] for ext in self.extensions]
+    print(f'Building requested CMake targets: {target_names}')
     subprocess.check_call(
-        [cmake, '--build', '.', f'-j{os.cpu_count()}', '--config', build_cfg],
+        [cmake, '--build', '.', '--config', build_cfg, '--target']
+        + target_names
+        + [f'-j{os.cpu_count()}'],
         cwd=self.build_temp,
     )
 
@@ -384,6 +405,32 @@ class InstallScripts(install_scripts.install_scripts):
         self.outfiles.append(oldfile)
 
 
+def get_extensions():
+  """Returns the list of CMake extensions to build."""
+  ext_names = list(DEFAULT_EXTENSIONS)
+  requested = os.environ.get(MUJOCO_PYTHON_EXTENSIONS, '').strip()
+  if requested:
+    requested_names = []
+    for raw_name in requested.split(','):
+      name = raw_name.strip()
+      if not name:
+        continue
+      if not name.startswith(EXT_PREFIX):
+        name = f'{EXT_PREFIX}{name}'
+      requested_names.append(name)
+
+    unknown = sorted(set(requested_names) - set(DEFAULT_EXTENSIONS))
+    if unknown:
+      raise ValueError(
+          f'Unknown extensions in {MUJOCO_PYTHON_EXTENSIONS}: {unknown}. '
+          f'Known extensions: {DEFAULT_EXTENSIONS}'
+      )
+
+    ext_names = [name for name in DEFAULT_EXTENSIONS if name in set(requested_names)]
+
+  return [CMakeExtension(name) for name in ext_names]
+
+
 setuptools.setup(
     long_description=get_long_description(),
     long_description_content_type='text/markdown',
@@ -391,19 +438,7 @@ setuptools.setup(
         build_ext=BuildCMakeExtension,
         install_scripts=InstallScripts,
     ),
-    ext_modules=[
-        CMakeExtension('mujoco._callbacks'),
-        CMakeExtension('mujoco._constants'),
-        CMakeExtension('mujoco._enums'),
-        CMakeExtension('mujoco._errors'),
-        CMakeExtension('mujoco._functions'),
-        CMakeExtension('mujoco._render'),
-        CMakeExtension('mujoco._rollout'),
-        CMakeExtension('mujoco._batch_forward'),
-        CMakeExtension('mujoco._simulate'),
-        CMakeExtension('mujoco._specs'),
-        CMakeExtension('mujoco._structs'),
-    ],
+    ext_modules=get_extensions(),
     scripts=['mujoco/mjpython/mjpython.py']
     if platform.system() == 'Darwin'
     else [],
