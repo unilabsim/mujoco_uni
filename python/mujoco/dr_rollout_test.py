@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for mujoco.domain_randomized_rollout.DomainRandomizedRolloutPool."""
+"""Tests for mujoco.dr_rollout.DomainRandomizedRolloutPool."""
 
 import copy
 
@@ -21,7 +21,7 @@ from absl.testing import parameterized
 import numpy as np
 
 import mujoco
-from mujoco import domain_randomized_rollout as drr
+from mujoco import dr_rollout as drr
 from mujoco import rollout as stateless_rollout
 
 

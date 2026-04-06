@@ -1,6 +1,6 @@
 """Persistent executor for reset-lifecycle domain-randomized rollouts.
 
-This module wraps the pybind-backed ``_domain_randomized_rollout`` pool. The
+This module wraps the pybind-backed ``_dr_rollout`` pool. The
 pool owns:
   * a per-environment ``mjModel`` pool (cloned from a caller-supplied base
     model via ``mj_copyModel``),
@@ -29,7 +29,7 @@ from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 import mujoco
-from mujoco import _domain_randomized_rollout as _native
+from mujoco import _dr_rollout as _native
 
 
 SUPPORTED_FIELDS = tuple(_native.SUPPORTED_FIELDS)

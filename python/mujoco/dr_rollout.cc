@@ -677,7 +677,7 @@ class DomainRandomizedRolloutPool {
   std::shared_ptr<ThreadPool> pool_;
 };
 
-PYBIND11_MODULE(_domain_randomized_rollout, pymodule) {
+PYBIND11_MODULE(_dr_rollout, pymodule) {
   py::class_<DomainRandomizedRolloutPool>(pymodule, "DomainRandomizedRolloutPool")
       .def(py::init([](py::object base_model, int nbatch, int nthread) {
              return std::make_unique<DomainRandomizedRolloutPool>(
