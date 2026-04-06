@@ -85,7 +85,7 @@ def run_parity(nthread):
     ref_last_state = ref_state_traj[:, -1, :].copy()
 
     # Per-env mj_forward on the final state (reference for sensor).
-    ref_fwd_state, ref_fwd_sensor = reference_forward_all(
+    _, ref_fwd_sensor = reference_forward_all(
         model, ref_last_state
     )
 
@@ -99,7 +99,7 @@ def run_parity(nthread):
         control=control,
     )
 
-    pool_fwd_state, pool_fwd_sensor = pool.forward(pool_state)
+    pool_fwd_sensor = pool.forward(pool_state)
     pool.close()
 
     # ── ASSERTIONS ───────────────────────────────────────────────
@@ -132,8 +132,6 @@ def run_parity(nthread):
 
     check(f"step() vs rollout last-step  [{tag}]",
           pool_state, ref_last_state)
-    check(f"forward() state vs ref       [{tag}]",
-          pool_fwd_state, ref_fwd_state)
     check(f"forward() sensor vs ref      [{tag}]",
           pool_fwd_sensor, ref_fwd_sensor)
 

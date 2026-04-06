@@ -343,13 +343,11 @@ void _unsafe_subset_reset_threaded(
 // ===================================================================
 
 // Single mj_forward over envs [start, end) on the pool's owned models —
-// no env_ids indirection, no model patching. Adapted from
-// batch_forward_bind.cc::_unsafe_batch_forward_range.
+// no env_ids indirection, no model patching.
 void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
                                 raw::MjData* d, int start, int end,
                                 const mjtNum* state0, const mjtNum* warmstart0,
-                                mjtNum* state_out, mjtNum* sensordata_out,
-                                int skipsensor) {
+                                mjtNum* sensordata_out, int skipsensor) {
   const raw::MjModel* m0 = models[0];
   size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
   size_t nv = static_cast<size_t>(m0->nv);
@@ -389,8 +387,6 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
 
     mj_forwardSkip(me, d, mjSTAGE_NONE, skipsensor);
 
-    mj_getState(me, d, state_out + static_cast<size_t>(r) * nstate,
-                mjSTATE_FULLPHYSICS);
     if (!skipsensor) {
       mju_copy(sensordata_out + static_cast<size_t>(r) * nsensordata,
                d->sensordata, nsensordata);
@@ -401,7 +397,7 @@ void _unsafe_full_forward_range(const std::vector<raw::MjModel*>& models,
 void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
                                    std::vector<raw::MjData*>& d, int nbatch,
                                    const mjtNum* state0,
-                                   const mjtNum* warmstart0, mjtNum* state_out,
+                                   const mjtNum* warmstart0,
                                    mjtNum* sensordata_out, int skipsensor,
                                    ThreadPool* pool, int chunk_size) {
   int nfulljobs = nbatch / chunk_size;
@@ -415,7 +411,7 @@ void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
       int id = pool->WorkerId();
       _unsafe_full_forward_range(models, d[id], j * chunk_size,
                                  (j + 1) * chunk_size, state0, warmstart0,
-                                 state_out, sensordata_out, skipsensor);
+                                 sensordata_out, skipsensor);
     };
     pool->Schedule(task);
   }
@@ -424,7 +420,7 @@ void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
       _unsafe_full_forward_range(
           models, d[pool->WorkerId()], nfulljobs * chunk_size,
           nfulljobs * chunk_size + chunk_remainder, state0, warmstart0,
-          state_out, sensordata_out, skipsensor);
+          sensordata_out, skipsensor);
     };
     pool->Schedule(task);
   }
@@ -585,14 +581,13 @@ class BatchEnvPool {
 
   // -----------------------------------------------------------------
   // Single mj_forward over all envs (no patching, no env_ids).
-  //   state output:      (nbatch, nstate)
   //   sensordata output: (nbatch, nsensordata)
   // Equivalent to the old mujoco.batch_forward path, just owned by the
   // pool's models/data instead of caller-supplied lists.
   // -----------------------------------------------------------------
-  py::tuple forward(const PyCArray state0,
-                    std::optional<const PyCArray> warmstart0, bool skipsensor,
-                    std::optional<int> chunk_size) {
+  PyCArray forward(const PyCArray state0,
+                   std::optional<const PyCArray> warmstart0, bool skipsensor,
+                   std::optional<int> chunk_size) {
     if (state0.shape(0) != nbatch_) {
       std::ostringstream msg;
       msg << "state0.shape[0]=" << state0.shape(0)
@@ -607,9 +602,7 @@ class BatchEnvPool {
     mjtNum* warmstart0_ptr =
         optional_array_ptr(warmstart0, "warmstart0", sz_warmstart);
 
-    PyCArray state_out({nbatch_, nstate_});
     PyCArray sensordata_out({nbatch_, nsensordata_});
-    mjtNum* state_ptr = static_cast<mjtNum*>(state_out.request().ptr);
     mjtNum* sensordata_ptr =
         static_cast<mjtNum*>(sensordata_out.request().ptr);
 
@@ -621,15 +614,15 @@ class BatchEnvPool {
                         : std::max(1, nbatch_ / (10 * nthread_));
         InterceptMjErrors(_unsafe_full_forward_threaded)(
             models_, worker_data_, nbatch_, state0_ptr, warmstart0_ptr,
-            state_ptr, sensordata_ptr, skipsensor ? 1 : 0, pool_.get(), chunk);
+            sensordata_ptr, skipsensor ? 1 : 0, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_full_forward_range)(
             models_, worker_data_[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
-            state_ptr, sensordata_ptr, skipsensor ? 1 : 0);
+            sensordata_ptr, skipsensor ? 1 : 0);
       }
     }
 
-    return py::make_tuple(state_out, sensordata_out);
+    return sensordata_out;
   }
 
   // -----------------------------------------------------------------
