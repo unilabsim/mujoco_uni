@@ -15,6 +15,8 @@
 """Install script for MuJoCo."""
 
 import fnmatch
+import hashlib
+import json
 import logging
 import os
 import platform
@@ -32,6 +34,7 @@ from setuptools.command import install_scripts
 
 MUJOCO_CMAKE = 'MUJOCO_CMAKE'
 MUJOCO_CMAKE_ARGS = 'MUJOCO_CMAKE_ARGS'
+MUJOCO_FETCHCONTENT_BASE_DIR = 'MUJOCO_FETCHCONTENT_BASE_DIR'
 MUJOCO_PATH = 'MUJOCO_PATH'
 MUJOCO_PLUGIN_PATH = 'MUJOCO_PLUGIN_PATH'
 MUJOCO_PYTHON_EXTENSIONS = 'MUJOCO_PYTHON_EXTENSIONS'
@@ -142,6 +145,68 @@ def parse_cmake_args_from_environ(env_var_name=MUJOCO_CMAKE_ARGS):
     if part:
       out.append(part)
   return out
+
+
+def _default_cache_root():
+  if platform.system() == 'Windows':
+    return os.path.join(
+        os.environ.get(
+            'LOCALAPPDATA',
+            os.path.join(os.path.expanduser('~'), 'AppData', 'Local'),
+        ),
+        'mujoco-uni',
+        'fetchcontent',
+    )
+  if platform.system() == 'Darwin':
+    return os.path.join(
+        os.path.expanduser('~/Library/Caches'),
+        'mujoco-uni',
+        'fetchcontent',
+    )
+  return os.path.join(
+      os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')),
+      'mujoco-uni',
+      'fetchcontent',
+  )
+
+
+def _sanitize_cache_token(value):
+  token = re.sub(r'[^A-Za-z0-9_.-]+', '-', value).strip('-')
+  return token or 'unknown'
+
+
+def get_fetchcontent_base_dir(build_cfg):
+  """Returns a stable FetchContent cache directory outside build/."""
+  override = os.environ.get(MUJOCO_FETCHCONTENT_BASE_DIR, '').strip()
+  if override:
+    return os.path.abspath(os.path.expanduser(override))
+
+  platform_tag = (
+      os.environ.get('_PYTHON_HOST_PLATFORM')
+      or sysconfig.get_platform()
+      or platform.machine()
+  )
+  variant = '-'.join([
+      _sanitize_cache_token(platform_tag),
+      f'py{sys.version_info.major}{sys.version_info.minor}',
+      build_cfg.lower(),
+  ])
+  fingerprint = hashlib.sha256(
+      json.dumps(
+          {
+              'archflags': os.environ.get('ARCHFLAGS', ''),
+              'cmake_args': os.environ.get(MUJOCO_CMAKE_ARGS, ''),
+              'cmake_generator': os.environ.get('CMAKE_GENERATOR', ''),
+              'cc': os.environ.get('CC', ''),
+              'cxx': os.environ.get('CXX', ''),
+              'deployment_target': os.environ.get(
+                  'MACOSX_DEPLOYMENT_TARGET', ''
+              ),
+          },
+          sort_keys=True,
+      ).encode('utf-8')
+  ).hexdigest()[:12]
+  return os.path.join(_default_cache_root(), f'{variant}-{fingerprint}')
 
 
 class CMakeExtension(setuptools.Extension):
@@ -301,6 +366,7 @@ class BuildCMakeExtension(build_ext.build_ext):
     """Check for CMake."""
     cmake = os.environ.get(MUJOCO_CMAKE, 'cmake')
     build_cfg = 'Debug' if self.debug else 'Release'
+    fetchcontent_base_dir = get_fetchcontent_base_dir(build_cfg)
     cmake_module_path = os.path.join(
         os.path.dirname(__file__), 'mujoco', 'cmake'
     )
@@ -313,6 +379,7 @@ class BuildCMakeExtension(build_ext.build_ext):
         (
             f'-DCMAKE_INTERPROCEDURAL_OPTIMIZATION:BOOL={"OFF" if self.debug else "ON"}'
         ),
+        f'-DFETCHCONTENT_BASE_DIR:PATH={fetchcontent_base_dir}',
         '-DCMAKE_Fortran_COMPILER:STRING=',
         '-DBUILD_TESTING:BOOL=OFF',
     ]
@@ -342,10 +409,12 @@ class BuildCMakeExtension(build_ext.build_ext):
 
     cmake_args.extend(parse_cmake_args_from_environ())
     os.makedirs(self.build_temp, exist_ok=True)
+    os.makedirs(fetchcontent_base_dir, exist_ok=True)
 
     if platform.system() == 'Windows':
       cmake_args = [arg.replace('\\', '/') for arg in cmake_args]
 
+    print(f'Using FetchContent cache directory: {fetchcontent_base_dir}')
     print('Configuring CMake with the following arguments:')
     for arg in cmake_args:
       print(f'    {arg}')
