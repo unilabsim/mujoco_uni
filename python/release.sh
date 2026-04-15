@@ -121,6 +121,49 @@ activate_conda_env() {
   echo "[env] activated newly created conda env: ${fallback_env}"
 }
 
+configure_macos_build_env() {
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    return 0
+  fi
+
+  local host_arch=""
+  local deployment_tag=""
+  host_arch="$(uname -m)"
+
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+  deployment_tag="${MACOSX_DEPLOYMENT_TARGET}"
+
+  if [[ -z "${ARCHFLAGS:-}" ]]; then
+    if [[ "$host_arch" == "arm64" ]]; then
+      export ARCHFLAGS="-arch arm64"
+    elif [[ "$host_arch" == "x86_64" ]]; then
+      export ARCHFLAGS="-arch x86_64"
+    fi
+  fi
+
+  if [[ "${MUJOCO_CMAKE_ARGS:-}" != *"CMAKE_OSX_ARCHITECTURES"* ]]; then
+    if [[ "$host_arch" == "arm64" ]]; then
+      export MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_OSX_ARCHITECTURES=arm64"
+    elif [[ "$host_arch" == "x86_64" ]]; then
+      export MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_OSX_ARCHITECTURES=x86_64"
+    fi
+  fi
+
+  if [[ -z "${_PYTHON_HOST_PLATFORM:-}" ]]; then
+    if [[ "$host_arch" == "arm64" ]]; then
+      export _PYTHON_HOST_PLATFORM="macosx-${deployment_tag}-arm64"
+    elif [[ "$host_arch" == "x86_64" ]]; then
+      export _PYTHON_HOST_PLATFORM="macosx-${deployment_tag}-x86_64"
+    fi
+  fi
+
+  echo "[env] macOS build defaults:"
+  echo "      MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
+  echo "      _PYTHON_HOST_PLATFORM=${_PYTHON_HOST_PLATFORM:-<unset>}"
+  echo "      ARCHFLAGS=${ARCHFLAGS:-<unset>}"
+  echo "      MUJOCO_CMAKE_ARGS=${MUJOCO_CMAKE_ARGS:-<unset>}"
+}
+
 get_version() {
   awk -F'"' '/^version = / {print $2; exit}' pyproject.toml
 }
@@ -155,6 +198,18 @@ retag_linux_wheels_for_upload() {
   fi
 }
 
+upload_dist_with_twine() {
+  local repo_name="$1"
+  local cmd=(python -m twine upload -r "$repo_name")
+
+  if [[ "$SKIP_EXISTING" -eq 1 ]]; then
+    cmd+=(--skip-existing)
+  fi
+
+  cmd+=(dist/*)
+  "${cmd[@]}"
+}
+
 cleanup_bundled_assets() {
   local bundle_dir="${ROOT_DIR}/mujoco"
   rm -rf "${bundle_dir}/include" "${bundle_dir}/plugin" "${bundle_dir}/cmake" "${bundle_dir}/simulate"
@@ -167,13 +222,10 @@ fi
 
 cd "$ROOT_DIR"
 trap cleanup_bundled_assets EXIT
+configure_macos_build_env
 
 VERSION="$(get_version)"
 UPSTREAM_VERSION="$(get_upstream_version "$VERSION")"
-TWINE_UPLOAD_ARGS=()
-if [[ "$SKIP_EXISTING" -eq 1 ]]; then
-  TWINE_UPLOAD_ARGS+=(--skip-existing)
-fi
 echo "[info] package version: ${VERSION}"
 echo "[info] upstream version: ${UPSTREAM_VERSION}"
 
@@ -190,10 +242,10 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
   retag_linux_wheels_for_upload
   python -m twine check dist/*
   if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
-    python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
+    upload_dist_with_twine testpypi
   fi
   if [[ "$UPLOAD_PYPI" -eq 1 ]]; then
-    python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r pypi dist/*
+    upload_dist_with_twine pypi
   fi
   if [[ "$SMOKE_TESTPYPI" -eq 1 ]]; then
     TMP_VENV="$(mktemp -d)"
@@ -209,7 +261,7 @@ if [[ "$UPLOAD_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
-python -m pip install --upgrade build twine wheel
+python -m pip install --upgrade build twine wheel absl-py
 if [[ "$(uname -s)" == "Linux" ]]; then
   python -m pip install --upgrade auditwheel
 fi
@@ -219,7 +271,7 @@ MUJOCO_SITE="$(pip show mujoco | awk -F': ' '/^Location:/ {print $2"/mujoco"; ex
 
 export MUJOCO_PATH="${MUJOCO_SITE}"
 export MUJOCO_PLUGIN_PATH="${MUJOCO_SITE}/plugin"
-export MUJOCO_CMAKE_ARGS="-DCMAKE_MODULE_PATH:PATH=${MUJOCO_REPO_ROOT}/cmake;${ROOT_DIR}/mujoco/cmake"
+export MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_MODULE_PATH:PATH=${MUJOCO_REPO_ROOT}/cmake;${ROOT_DIR}/mujoco/cmake"
 
 BUNDLE_DIR="${ROOT_DIR}/mujoco"
 cleanup_bundled_assets
@@ -266,6 +318,7 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
   else
     # shellcheck disable=SC1090
     source "$conda_init_script"
+    CONDA_BASE="$(conda info --base)"
     CURRENT_PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
     for pyver in 3.10 3.11 3.12 3.13; do
       if [[ "$pyver" == "$CURRENT_PY_VER" ]]; then
@@ -273,15 +326,33 @@ if [[ "$BUILD_ALL_PYTHON" -eq 1 ]]; then
         continue
       fi
       env_name="mj_wheel_py${pyver//./}"
+      env_prefix="${CONDA_BASE}/envs/${env_name}"
       echo "[info] building wheel for Python $pyver (conda env: $env_name)"
-      conda create -n "$env_name" python="$pyver" -y 2>/dev/null || conda install -n "$env_name" python="$pyver" -y 2>/dev/null || true
+
+      if [[ -d "$env_prefix" && ! -f "$env_prefix/conda-meta/history" ]]; then
+        echo "[warn] skip Python $pyver: ${env_prefix} exists but is not a valid conda environment"
+        echo "[warn] remove that directory or repair the environment, then rerun --build-all-python"
+        continue
+      fi
+
+      conda create -n "$env_name" python="$pyver" -y || conda install -n "$env_name" python="$pyver" -y || true
+
+      if ! conda run -n "$env_name" --no-capture-output python -V >/dev/null 2>&1; then
+        echo "[warn] skip Python $pyver: conda env ${env_name} is unavailable after create/install"
+        continue
+      fi
+
       conda run -n "$env_name" --no-capture-output bash -c "
-        pip install -q 'mujoco==${UPSTREAM_VERSION}' build
+        export MACOSX_DEPLOYMENT_TARGET='${MACOSX_DEPLOYMENT_TARGET:-}'
+        export _PYTHON_HOST_PLATFORM='${_PYTHON_HOST_PLATFORM:-}'
+        export ARCHFLAGS='${ARCHFLAGS:-}'
+        export MUJOCO_CMAKE_ARGS='${MUJOCO_CMAKE_ARGS:-}'
+        pip install -q 'mujoco==${UPSTREAM_VERSION}' build absl-py
         MUJOCO_SITE=\$(pip show mujoco | awk -F': ' '/^Location:/ {print \$2\"/mujoco\"; exit}')
         export MUJOCO_PATH=\$MUJOCO_SITE
         export MUJOCO_PLUGIN_PATH=\$MUJOCO_SITE/plugin
         cd '${ROOT_DIR}' && python -m build --wheel --no-isolation
-      " 2>/dev/null || echo "[warn] failed to build wheel for Python $pyver"
+      " || echo "[warn] failed to build wheel for Python $pyver"
     done
   fi
 fi
@@ -291,11 +362,11 @@ python -m twine check dist/*
 retag_linux_wheels_for_upload
 
 if [[ "$UPLOAD_TESTPYPI" -eq 1 ]]; then
-  python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r testpypi dist/*
+  upload_dist_with_twine testpypi
 fi
 
 if [[ "$UPLOAD_PYPI" -eq 1 ]]; then
-  python -m twine upload "${TWINE_UPLOAD_ARGS[@]}" -r pypi dist/*
+  upload_dist_with_twine pypi
 fi
 
 if [[ "$SMOKE_TESTPYPI" -eq 1 ]]; then
