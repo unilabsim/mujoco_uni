@@ -203,14 +203,28 @@ for abi in "${ABI_TAGS[@]}"; do
   abi_args+=("$abi")
 done
 
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+CONTAINER_HOME="/tmp/mujoco-uni-home-${HOST_UID}"
+CONTAINER_CACHE_HOME="${CONTAINER_HOME}/.cache"
+CONTAINER_PIP_CACHE_DIR="${CONTAINER_CACHE_HOME}/pip"
+
 "${RUNTIME}" exec \
-  -u "$(id -u):$(id -g)" \
+  -u "${HOST_UID}:${HOST_GID}" \
+  -e HOME="${CONTAINER_HOME}" \
+  -e XDG_CACHE_HOME="${CONTAINER_CACHE_HOME}" \
+  -e PIP_CACHE_DIR="${CONTAINER_PIP_CACHE_DIR}" \
   -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
   -e MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-}" \
   "${CONTAINER_NAME}" \
   /bin/bash -lc "$(cat <<'EOF'
 set -euo pipefail
 cd /work/python
+
+export HOME="${HOME:-/tmp/mujoco-uni-home}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${XDG_CACHE_HOME}/pip}"
+mkdir -p "${HOME}" "${XDG_CACHE_HOME}" "${PIP_CACHE_DIR}"
 
 mkdir -p /tmp/mujoco-uni-manylinux-build
 preserve_dir=/tmp/mujoco-uni-manylinux-build/preserve-dist
