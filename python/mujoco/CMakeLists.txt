@@ -150,10 +150,11 @@ if(NOT TARGET mujoco)
 endif()
 
 # ==================== ABSEIL ==================================================
+option(MUJOCO_PYTHON_USE_SYSTEM_ABSL "Use installed Abseil version." OFF)
 set(MUJOCO_PYTHON_ABSL_TARGETS absl::core_headers absl::flat_hash_map absl::span)
 findorfetch(
   USE_SYSTEM_PACKAGE
-  OFF
+  MUJOCO_PYTHON_USE_SYSTEM_ABSL
   PACKAGE_NAME
   absl
   LIBRARY_NAME
@@ -184,9 +185,10 @@ endforeach()
 
 # ==================== EIGEN ===================================================
 add_compile_definitions(EIGEN_MPL2_ONLY)
+option(MUJOCO_PYTHON_USE_SYSTEM_EIGEN "Use installed Eigen3 version." OFF)
 findorfetch(
   USE_SYSTEM_PACKAGE
-  ON
+  MUJOCO_PYTHON_USE_SYSTEM_EIGEN
   PACKAGE_NAME
   Eigen3
   LIBRARY_NAME
