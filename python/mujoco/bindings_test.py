@@ -17,8 +17,10 @@
 import contextlib
 import copy
 from etils import epath
+import importlib
 import pickle
 import sys
+import types
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -165,6 +167,16 @@ class MuJoCoBindingsTest(parameterized.TestCase):
     np.testing.assert_array_equal(
         self.data.qpos, [0.12345] * len(self.data.qpos)
     )
+
+  def test_batch_forward_import_preserves_submodule(self):
+    from mujoco import batch_forward
+
+    batch_forward_module = importlib.import_module('mujoco.batch_forward')
+
+    self.assertIsInstance(batch_forward, types.ModuleType)
+    self.assertIs(batch_forward, batch_forward_module)
+    self.assertTrue(hasattr(batch_forward, 'BatchForwardRunner'))
+    self.assertTrue(hasattr(batch_forward, 'batch_forward'))
 
   def test_array_is_a_view(self):
     qpos_ref = self.data.qpos
