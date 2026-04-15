@@ -250,10 +250,4 @@ def _load_all_bundled_plugins():
 
 _load_all_bundled_plugins()
 
-try:
-  from mujoco.batch_forward import BatchForwardRunner  # pytype: disable=import-error
-  from mujoco.batch_forward import batch_forward  # pytype: disable=import-error
-except ImportError:
-  pass
-
 __version__ = mj_versionString()  # pylint: disable=undefined-variable
