@@ -56,9 +56,12 @@ using PyCArray = py::array_t<mjtNum, py::array::c_style>;
 enum class FieldId {
   kBodyMass,
   kBodyIpos,
+  kBodyIquat,
+  kBodyInertia,
   kGeomFriction,
   kDofArmature,
-  kDofDamping,
+  kKp,
+  kKd,
 };
 
 struct FieldSpec {
@@ -70,9 +73,12 @@ struct FieldSpec {
 constexpr FieldSpec kFieldSpecs[] = {
     {"body_mass",     FieldId::kBodyMass,     true},
     {"body_ipos",     FieldId::kBodyIpos,     true},
+    {"body_iquat",    FieldId::kBodyIquat,    true},
+    {"body_inertia",  FieldId::kBodyInertia,  true},
     {"dof_armature",  FieldId::kDofArmature,  true},
     {"geom_friction", FieldId::kGeomFriction, false},
-    {"dof_damping",   FieldId::kDofDamping,   false},
+    {"kp",            FieldId::kKp,           false},
+    {"kd",            FieldId::kKd,           false},
 };
 
 // Element count of the field for a given model.
@@ -80,23 +86,85 @@ int FieldSize(FieldId id, const raw::MjModel* m) {
   switch (id) {
     case FieldId::kBodyMass:     return m->nbody;
     case FieldId::kBodyIpos:     return 3 * m->nbody;
+    case FieldId::kBodyIquat:    return 4 * m->nbody;
+    case FieldId::kBodyInertia:  return 3 * m->nbody;
     case FieldId::kDofArmature:  return m->nv;
     case FieldId::kGeomFriction: return 3 * m->ngeom;
-    case FieldId::kDofDamping:   return m->nv;
+    case FieldId::kKp:           return m->nu;
+    case FieldId::kKd:           return m->nu;
   }
   return 0;
 }
 
-// Pointer to the field storage in m.
-mjtNum* FieldPtr(FieldId id, raw::MjModel* m) {
+// Pointer to contiguous field storage in m.
+mjtNum* ContiguousFieldPtr(FieldId id, raw::MjModel* m) {
   switch (id) {
     case FieldId::kBodyMass:     return m->body_mass;
     case FieldId::kBodyIpos:     return m->body_ipos;
+    case FieldId::kBodyIquat:    return m->body_iquat;
+    case FieldId::kBodyInertia:  return m->body_inertia;
     case FieldId::kDofArmature:  return m->dof_armature;
     case FieldId::kGeomFriction: return m->geom_friction;
-    case FieldId::kDofDamping:   return m->dof_damping;
+    case FieldId::kKp:
+    case FieldId::kKd:
+      return nullptr;
   }
   return nullptr;
+}
+
+const mjtNum* ContiguousFieldPtr(FieldId id, const raw::MjModel* m) {
+  return ContiguousFieldPtr(id, const_cast<raw::MjModel*>(m));
+}
+
+void CopyFieldOut(FieldId id, const raw::MjModel* m, mjtNum* dst) {
+  switch (id) {
+    case FieldId::kBodyMass:
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyIquat:
+    case FieldId::kBodyInertia:
+    case FieldId::kDofArmature:
+    case FieldId::kGeomFriction:
+      mju_copy(dst, ContiguousFieldPtr(id, m), FieldSize(id, m));
+      return;
+
+    case FieldId::kKp:
+      for (int i = 0; i < m->nu; ++i) {
+        dst[i] = m->actuator_gainprm[mjNGAIN * i];
+      }
+      return;
+
+    case FieldId::kKd:
+      for (int i = 0; i < m->nu; ++i) {
+        dst[i] = -m->actuator_biasprm[mjNBIAS * i + 2];
+      }
+      return;
+  }
+}
+
+void WriteField(FieldId id, raw::MjModel* m, const mjtNum* src) {
+  switch (id) {
+    case FieldId::kBodyMass:
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyIquat:
+    case FieldId::kBodyInertia:
+    case FieldId::kDofArmature:
+    case FieldId::kGeomFriction:
+      mju_copy(ContiguousFieldPtr(id, m), src, FieldSize(id, m));
+      return;
+
+    case FieldId::kKp:
+      for (int i = 0; i < m->nu; ++i) {
+        m->actuator_gainprm[mjNGAIN * i] = src[i];
+        m->actuator_biasprm[mjNBIAS * i + 1] = -src[i];
+      }
+      return;
+
+    case FieldId::kKd:
+      for (int i = 0; i < m->nu; ++i) {
+        m->actuator_biasprm[mjNBIAS * i + 2] = -src[i];
+      }
+      return;
+  }
 }
 
 const FieldSpec* LookupField(const std::string& name) {
@@ -705,11 +773,10 @@ class BatchEnvPool {
         }
         const mjtNum* src = static_cast<const mjtNum*>(info.ptr);
 
-        // Apply per-env in C++ (GIL held — this loop is strictly memcpy).
+        // Apply per-env in C++ while the GIL is held.
         for (int k = 0; k < n; ++k) {
           int e = env_ids_ptr[k];
-          mjtNum* dst = FieldPtr(spec->id, models_[e]);
-          mju_copy(dst, src + static_cast<size_t>(k) * field_size, field_size);
+          WriteField(spec->id, models_[e], src + static_cast<size_t>(k) * field_size);
         }
         if (spec->needs_refresh) {
           for (int k = 0; k < n; ++k) needs_refresh[k] = 1;
@@ -769,10 +836,10 @@ class BatchEnvPool {
       throw py::value_error(msg.str());
     }
     int sz = FieldSize(spec->id, models_[env_id]);
-    mjtNum* ptr = FieldPtr(spec->id, models_[env_id]);
     // Copy into a fresh array to avoid lifetime entanglement with the pool.
     py::array_t<mjtNum> out(static_cast<py::ssize_t>(sz));
-    mju_copy(static_cast<mjtNum*>(out.request().ptr), ptr, sz);
+    CopyFieldOut(
+        spec->id, models_[env_id], static_cast<mjtNum*>(out.request().ptr));
     return out;
   }
 
