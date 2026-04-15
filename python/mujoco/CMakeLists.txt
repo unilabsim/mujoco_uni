@@ -153,7 +153,7 @@ endif()
 set(MUJOCO_PYTHON_ABSL_TARGETS absl::core_headers absl::flat_hash_map absl::span)
 findorfetch(
   USE_SYSTEM_PACKAGE
-  ON
+  OFF
   PACKAGE_NAME
   absl
   LIBRARY_NAME
