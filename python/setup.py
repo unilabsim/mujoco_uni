@@ -382,6 +382,8 @@ class BuildCMakeExtension(build_ext.build_ext):
         f'-DFETCHCONTENT_BASE_DIR:PATH={fetchcontent_base_dir}',
         '-DCMAKE_Fortran_COMPILER:STRING=',
         '-DBUILD_TESTING:BOOL=OFF',
+        '-DMUJOCO_BUILD_TESTS:BOOL=OFF',
+        '-DMUJOCO_BUILD_TESTS_WASM:BOOL=OFF',
     ]
 
     if self._mujoco_framework_path is not None:
