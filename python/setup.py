@@ -46,7 +46,6 @@ DEFAULT_EXTENSIONS = (
     'mujoco._render',
     'mujoco._rollout',
     'mujoco._batch_env',
-    'mujoco._batch_forward',
     'mujoco._simulate',
     'mujoco._specs',
     'mujoco._structs',
