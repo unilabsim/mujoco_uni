@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${ROOT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${ROOT_DIR}/.." && pwd -P)"
 RUNTIME=""
 ARCH="auto"
 CONTAINER_NAME=""
@@ -121,10 +121,35 @@ map_python_to_abi() {
 ensure_container_exists() {
   local image="$1"
   local container_state=""
+  local mounted_repo=""
+  local configured_workdir=""
+  local configured_image=""
 
   container_state="$("${RUNTIME}" ps -a --filter "name=^/${CONTAINER_NAME}$" --format '{{.Status}}' | head -n1)"
   if [[ -z "$container_state" ]]; then
     echo "[info] creating build container: ${CONTAINER_NAME}"
+    "${RUNTIME}" run -d --name "${CONTAINER_NAME}" \
+      -v "${REPO_ROOT}:/work" \
+      -w /work \
+      "${image}" \
+      /bin/bash -lc 'trap : TERM INT; while sleep 3600; do :; done' >/dev/null
+    return 0
+  fi
+
+  mounted_repo="$("${RUNTIME}" inspect "${CONTAINER_NAME}" \
+    --format '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Source}}{{end}}{{end}}')"
+  configured_workdir="$("${RUNTIME}" inspect "${CONTAINER_NAME}" \
+    --format '{{.Config.WorkingDir}}')"
+  configured_image="$("${RUNTIME}" inspect "${CONTAINER_NAME}" \
+    --format '{{.Config.Image}}')"
+
+  if [[ -z "$mounted_repo" || "${mounted_repo}" != "${REPO_ROOT}" || \
+        "${configured_workdir}" != "/work" || "${configured_image}" != "${image}" ]]; then
+    echo "[info] recreating container ${CONTAINER_NAME} for current workspace"
+    if [[ "$container_state" == Up* ]]; then
+      "${RUNTIME}" stop "${CONTAINER_NAME}" >/dev/null
+    fi
+    "${RUNTIME}" rm -f "${CONTAINER_NAME}" >/dev/null
     "${RUNTIME}" run -d --name "${CONTAINER_NAME}" \
       -v "${REPO_ROOT}:/work" \
       -w /work \
