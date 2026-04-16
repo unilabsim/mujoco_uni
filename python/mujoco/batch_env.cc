@@ -48,6 +48,7 @@ namespace {
 
 namespace py = ::pybind11;
 using PyCArray = py::array_t<mjtNum, py::array::c_style>;
+using PyIArray = py::array_t<int, py::array::c_style>;
 
 // ===================================================================
 // Field registry — supported reset-lifecycle randomization fields.
@@ -92,6 +93,41 @@ int FieldSize(FieldId id, const raw::MjModel* m) {
     case FieldId::kGeomFriction: return 3 * m->ngeom;
     case FieldId::kKp:           return m->nu;
     case FieldId::kKd:           return m->nu;
+  }
+  return 0;
+}
+
+int FieldComponentWidth(FieldId id) {
+  switch (id) {
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyInertia:
+    case FieldId::kGeomFriction:
+      return 3;
+    case FieldId::kBodyIquat:
+      return 4;
+    case FieldId::kBodyMass:
+    case FieldId::kDofArmature:
+    case FieldId::kKp:
+    case FieldId::kKd:
+      return 1;
+  }
+  return 0;
+}
+
+int FieldIndexCount(FieldId id, const raw::MjModel* m) {
+  switch (id) {
+    case FieldId::kBodyMass:
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyIquat:
+    case FieldId::kBodyInertia:
+      return m->nbody;
+    case FieldId::kDofArmature:
+      return m->nv;
+    case FieldId::kGeomFriction:
+      return m->ngeom;
+    case FieldId::kKp:
+    case FieldId::kKd:
+      return m->nu;
   }
   return 0;
 }
@@ -167,6 +203,55 @@ void WriteField(FieldId id, raw::MjModel* m, const mjtNum* src) {
   }
 }
 
+void CopyIndexedFieldOut(FieldId id, const raw::MjModel* m, int index,
+                         mjtNum* dst) {
+  int width = FieldComponentWidth(id);
+  switch (id) {
+    case FieldId::kBodyMass:
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyIquat:
+    case FieldId::kBodyInertia:
+    case FieldId::kDofArmature:
+    case FieldId::kGeomFriction:
+      mju_copy(dst, ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width,
+               width);
+      return;
+
+    case FieldId::kKp:
+      dst[0] = m->actuator_gainprm[mjNGAIN * index];
+      return;
+
+    case FieldId::kKd:
+      dst[0] = -m->actuator_biasprm[mjNBIAS * index + 2];
+      return;
+  }
+}
+
+void WriteIndexedField(FieldId id, raw::MjModel* m, int index,
+                       const mjtNum* src) {
+  int width = FieldComponentWidth(id);
+  switch (id) {
+    case FieldId::kBodyMass:
+    case FieldId::kBodyIpos:
+    case FieldId::kBodyIquat:
+    case FieldId::kBodyInertia:
+    case FieldId::kDofArmature:
+    case FieldId::kGeomFriction:
+      mju_copy(ContiguousFieldPtr(id, m) + static_cast<size_t>(index) * width, src,
+               width);
+      return;
+
+    case FieldId::kKp:
+      m->actuator_gainprm[mjNGAIN * index] = src[0];
+      m->actuator_biasprm[mjNBIAS * index + 1] = -src[0];
+      return;
+
+    case FieldId::kKd:
+      m->actuator_biasprm[mjNBIAS * index + 2] = -src[0];
+      return;
+  }
+}
+
 const FieldSpec* LookupField(const std::string& name) {
   for (const FieldSpec& spec : kFieldSpecs) {
     if (name == spec.name) return &spec;
@@ -185,6 +270,33 @@ std::string SupportedFieldsString() {
   }
   msg << "}";
   return msg.str();
+}
+
+const FieldSpec& LookupFieldOrThrow(const std::string& name) {
+  const FieldSpec* spec = LookupField(name);
+  if (!spec) {
+    std::ostringstream msg;
+    msg << "Unknown field '" << name
+        << "'. Supported: " << SupportedFieldsString();
+    throw py::value_error(msg.str());
+  }
+  return *spec;
+}
+
+void ValidateEnvIdOrThrow(int env_id, int nbatch) {
+  if (env_id < 0 || env_id >= nbatch) {
+    throw py::value_error("env_id out of range");
+  }
+}
+
+void ValidateFieldIndexOrThrow(int index, int index_count,
+                               const std::string& name) {
+  if (index < 0 || index >= index_count) {
+    std::ostringstream msg;
+    msg << "Index " << index << " is out of range for field '" << name
+        << "' with size " << index_count;
+    throw py::value_error(msg.str());
+  }
 }
 
 // ===================================================================
@@ -825,22 +937,72 @@ class BatchEnvPool {
   // Intended for tests. The returned array shares memory with the pool and
   // must not be mutated by the caller.
   py::array_t<mjtNum> get_field(int env_id, const std::string& name) {
-    if (env_id < 0 || env_id >= nbatch_) {
-      throw py::value_error("env_id out of range");
-    }
-    const FieldSpec* spec = LookupField(name);
-    if (!spec) {
-      std::ostringstream msg;
-      msg << "Unknown field '" << name
-          << "'. Supported: " << SupportedFieldsString();
-      throw py::value_error(msg.str());
-    }
-    int sz = FieldSize(spec->id, models_[env_id]);
+    ValidateEnvIdOrThrow(env_id, nbatch_);
+    const FieldSpec& spec = LookupFieldOrThrow(name);
+    int sz = FieldSize(spec.id, models_[env_id]);
     // Copy into a fresh array to avoid lifetime entanglement with the pool.
     py::array_t<mjtNum> out(static_cast<py::ssize_t>(sz));
     CopyFieldOut(
-        spec->id, models_[env_id], static_cast<mjtNum*>(out.request().ptr));
+        spec.id, models_[env_id], static_cast<mjtNum*>(out.request().ptr));
     return out;
+  }
+
+  py::array_t<mjtNum> get_field_indexed(int env_id, const std::string& name,
+                                        const PyIArray indices) {
+    ValidateEnvIdOrThrow(env_id, nbatch_);
+    const FieldSpec& spec = LookupFieldOrThrow(name);
+    py::buffer_info index_info = indices.request();
+    if (index_info.ndim != 1) {
+      throw py::value_error("indices must be a 1-D array");
+    }
+
+    int n = static_cast<int>(index_info.shape[0]);
+    int width = FieldComponentWidth(spec.id);
+    int index_count = FieldIndexCount(spec.id, models_[env_id]);
+    std::vector<py::ssize_t> shape =
+        width == 1 ? std::vector<py::ssize_t>{n}
+                   : std::vector<py::ssize_t>{n, width};
+    py::array_t<mjtNum> out(shape);
+    mjtNum* dst = static_cast<mjtNum*>(out.request().ptr);
+    const int* index_ptr = static_cast<const int*>(index_info.ptr);
+    for (int i = 0; i < n; ++i) {
+      ValidateFieldIndexOrThrow(index_ptr[i], index_count, name);
+      CopyIndexedFieldOut(spec.id, models_[env_id], index_ptr[i],
+                          dst + static_cast<size_t>(i) * width);
+    }
+    return out;
+  }
+
+  void set_field_indexed(int env_id, const std::string& name,
+                         const PyIArray indices, const PyCArray value) {
+    ValidateEnvIdOrThrow(env_id, nbatch_);
+    const FieldSpec& spec = LookupFieldOrThrow(name);
+    py::buffer_info index_info = indices.request();
+    if (index_info.ndim != 1) {
+      throw py::value_error("indices must be a 1-D array");
+    }
+
+    int n = static_cast<int>(index_info.shape[0]);
+    int width = FieldComponentWidth(spec.id);
+    size_t expected = static_cast<size_t>(n) * width;
+    py::buffer_info value_info = value.request();
+    if (static_cast<size_t>(value_info.size) != expected) {
+      std::ostringstream msg;
+      msg << "value.size should be " << expected << ", got " << value_info.size;
+      throw py::value_error(msg.str());
+    }
+
+    int index_count = FieldIndexCount(spec.id, models_[env_id]);
+    const int* index_ptr = static_cast<const int*>(index_info.ptr);
+    const mjtNum* src = static_cast<const mjtNum*>(value_info.ptr);
+    for (int i = 0; i < n; ++i) {
+      ValidateFieldIndexOrThrow(index_ptr[i], index_count, name);
+      WriteIndexedField(spec.id, models_[env_id], index_ptr[i],
+                        src + static_cast<size_t>(i) * width);
+    }
+    if (spec.needs_refresh && n > 0) {
+      InterceptMjErrors(mj_setConst)(models_[env_id], worker_data_[0]);
+    }
   }
 
  private:
@@ -876,6 +1038,11 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("skipsensor") = false, py::arg("chunk_size") = py::none())
       .def("get_field", &BatchEnvPool::get_field, py::arg("env_id"),
            py::arg("name"))
+      .def("get_field_indexed", &BatchEnvPool::get_field_indexed,
+           py::arg("env_id"), py::arg("name"), py::arg("indices"))
+      .def("set_field_indexed", &BatchEnvPool::set_field_indexed,
+           py::arg("env_id"), py::arg("name"), py::arg("indices"),
+           py::arg("value"))
       .def_property_readonly("nbatch", &BatchEnvPool::nbatch)
       .def_property_readonly("nthread", &BatchEnvPool::nthread)
       .def_property_readonly("nstate", &BatchEnvPool::nstate)
