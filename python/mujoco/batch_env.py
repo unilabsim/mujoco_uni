@@ -25,6 +25,7 @@ Supported randomization fields are listed in ``SUPPORTED_FIELDS``.
 
 from __future__ import annotations
 
+import numbers
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -33,6 +34,52 @@ from mujoco import _batch_env as _native
 
 
 SUPPORTED_FIELDS = tuple(_native.SUPPORTED_FIELDS)
+_FIELD_COMPONENT_WIDTHS = {
+    "body_mass": 1,
+    "body_ipos": 3,
+    "body_iquat": 4,
+    "body_inertia": 3,
+    "dof_armature": 1,
+    "geom_friction": 3,
+    "kp": 1,
+    "kd": 1,
+}
+
+
+def _normalize_indices(indices) -> tuple[np.ndarray, bool]:
+  if isinstance(indices, (bool, np.bool_)):
+    raise TypeError("indices must be an int or a 1-D sequence of ints")
+  if isinstance(indices, numbers.Integral):
+    return np.asarray([int(indices)], dtype=np.int32), True
+  if isinstance(indices, (str, bytes)):
+    raise TypeError("indices must be an int or a 1-D sequence of ints")
+
+  arr = np.asarray(indices)
+  if arr.ndim != 1:
+    raise ValueError(f"indices must be 1-D, got shape {arr.shape}")
+  if arr.dtype.kind not in ("i", "u"):
+    raise TypeError("indices must contain integers")
+  return np.ascontiguousarray(arr, dtype=np.int32), False
+
+
+def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
+  width = _FIELD_COMPONENT_WIDTHS[name]
+  arr = np.asarray(value, dtype=np.float64)
+  expected_shape = (
+      ()
+      if scalar_index and width == 1
+      else (width,)
+      if scalar_index
+      else (nindex,)
+      if width == 1
+      else (nindex, width)
+  )
+  if arr.shape != expected_shape:
+    raise ValueError(
+        f"value for field '{name}' must have shape {expected_shape}, "
+        f"got {arr.shape}"
+    )
+  return np.ascontiguousarray(arr.reshape(-1), dtype=np.float64)
 
 
 class BatchEnvPool:
@@ -102,7 +149,7 @@ class BatchEnvPool:
 
     Args:
       initial_state: ``(nbatch, nstate)`` full-physics initial states.
-      nstep: number of steps.
+      nstep: number of steps.randomization
       control_spec: MuJoCo ``mjtState`` flags for control.
       control: ``(nbatch, nstep, ncontrol)`` control trajectories, optional.
       initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
@@ -256,3 +303,46 @@ class BatchEnvPool:
     if self._pool is None:
       raise RuntimeError("get_field requested after pool close")
     return self._pool.get_field(int(env_id), str(name))
+
+  def get_field_indexed(
+      self, env_id: int, name: str, indices: int | Sequence[int]
+  ):
+    """Return selected entries from one field for one environment.
+
+    Scalar fields return a scalar for single-index access and ``(k,)`` for
+    multi-index access. Multi-component fields return ``(width,)`` for
+    single-index access and ``(k, width)`` for multi-index access.
+    """
+    if self._pool is None:
+      raise RuntimeError("get_field_indexed requested after pool close")
+    name = str(name)
+    if name not in SUPPORTED_FIELDS:
+      raise ValueError(f"Unknown field '{name}'. Supported: {SUPPORTED_FIELDS}")
+    indices_arr, scalar_index = _normalize_indices(indices)
+    out = self._pool.get_field_indexed(int(env_id), name, indices_arr)
+    if not scalar_index:
+      return out
+    if _FIELD_COMPONENT_WIDTHS[name] == 1:
+      return out[0].item()
+    return out[0]
+
+  def set_field_indexed(
+      self,
+      env_id: int,
+      name: str,
+      indices: int | Sequence[int],
+      value,
+  ) -> None:
+    """Set selected entries from one field for one environment."""
+    if self._pool is None:
+      raise RuntimeError("set_field_indexed requested after pool close")
+    name = str(name)
+    if name not in SUPPORTED_FIELDS:
+      raise ValueError(f"Unknown field '{name}'. Supported: {SUPPORTED_FIELDS}")
+    indices_arr, scalar_index = _normalize_indices(indices)
+    value_arr = _normalize_indexed_value(
+        name, scalar_index, int(indices_arr.shape[0]), value
+    )
+    self._pool.set_field_indexed(
+        int(env_id), name, indices_arr, value_arr
+    )
