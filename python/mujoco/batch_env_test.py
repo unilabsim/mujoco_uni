@@ -208,6 +208,101 @@ class ConstructorTest(absltest.TestCase):
     with self.assertRaises(ValueError):
       batch_env.BatchEnvPool(model, nbatch=0, nthread=1)
 
+  def test_model_sequence_copies_per_env(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    model1 = copy.copy(model0)
+    model1.body_mass[:] *= 2.0
+    model1.geom_friction[1] = np.array([0.9, 0.01, 0.001], dtype=np.float64)
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0) as pool:
+      np.testing.assert_allclose(
+          pool.get_field(0, "body_mass"), np.asarray(model0.body_mass).reshape(-1)
+      )
+      np.testing.assert_allclose(
+          pool.get_field(1, "body_mass"), np.asarray(model1.body_mass).reshape(-1)
+      )
+      np.testing.assert_allclose(
+          pool.get_field(0, "geom_friction"),
+          np.asarray(model0.geom_friction).reshape(-1),
+      )
+      np.testing.assert_allclose(
+          pool.get_field(1, "geom_friction"),
+          np.asarray(model1.geom_friction).reshape(-1),
+      )
+
+  def test_model_sequence_length_one_expands(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    with batch_env.BatchEnvPool([model], nbatch=3, nthread=0) as pool:
+      expected = np.asarray(model.body_mass).reshape(-1)
+      for env_id in range(3):
+        np.testing.assert_allclose(pool.get_field(env_id, "body_mass"), expected)
+
+  def test_invalid_model_sequence_length(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool([model, copy.copy(model)], nbatch=3, nthread=0)
+
+  def test_incompatible_model_sequence(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML)
+    model1 = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0)
+
+  def test_get_model_returns_pool_owned_reference(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    model1 = copy.copy(model0)
+    model1.body_mass[:] *= 2.0
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0) as pool:
+      pooled_model = pool.get_model(1)
+      self.assertIsInstance(pooled_model, mujoco.MjModel)
+      self.assertEqual(pooled_model._address, pool.get_model(1)._address)
+
+      pooled_model.body_mass[:] *= 3.0
+      np.testing.assert_allclose(
+          pool.get_field(1, "body_mass"),
+          np.asarray(pooled_model.body_mass).reshape(-1),
+      )
+      np.testing.assert_allclose(
+          pool.get_field(0, "body_mass"),
+          np.asarray(model0.body_mass).reshape(-1),
+      )
+
+  def test_get_model_many_returns_selected_references(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    model1 = copy.copy(model0)
+    model2 = copy.copy(model0)
+    model1.body_mass[:] *= 2.0
+    model2.body_mass[:] *= 4.0
+
+    with batch_env.BatchEnvPool(
+        [model0, model1, model2], nbatch=3, nthread=0
+    ) as pool:
+      models = pool.get_model([2, 0])
+      self.assertLen(models, 2)
+      self.assertEqual(models[0]._address, pool.get_model(2)._address)
+      self.assertEqual(models[1]._address, pool.get_model(0)._address)
+      np.testing.assert_allclose(
+          np.asarray(models[0].body_mass).reshape(-1),
+          pool.get_field(2, "body_mass"),
+      )
+      np.testing.assert_allclose(
+          np.asarray(models[1].body_mass).reshape(-1),
+          pool.get_field(0, "body_mass"),
+      )
+
+  def test_get_all_models_returns_all_references(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+
+    with batch_env.BatchEnvPool(model, nbatch=3, nthread=0) as pool:
+      models = pool.get_all_models()
+      self.assertLen(models, 3)
+
+      models[1].body_mass[:] *= 5.0
+      np.testing.assert_allclose(
+          pool.get_field(1, "body_mass"),
+          np.asarray(models[1].body_mass).reshape(-1),
+      )
   def test_supported_fields(self):
     self.assertEqual(
         batch_env.SUPPORTED_FIELDS,

@@ -50,6 +50,11 @@ namespace py = ::pybind11;
 using PyCArray = py::array_t<mjtNum, py::array::c_style>;
 using PyIArray = py::array_t<int, py::array::c_style>;
 
+void KeepAlivePyObjectCapsuleDestructor(PyObject* pyobj) {
+  py::gil_scoped_acquire gil;
+  delete static_cast<py::object*>(PyCapsule_GetPointer(pyobj, nullptr));
+}
+
 // ===================================================================
 // Field registry — supported reset-lifecycle randomization fields.
 // ===================================================================
@@ -933,6 +938,43 @@ class BatchEnvPool {
   int nv() const { return nv_; }
   int nsensordata() const { return nsensordata_; }
 
+  py::object get_model(int env_id) {
+    ValidateEnvIdOrThrow(env_id, nbatch_);
+    if (MjModelWrapper* wrapper = MjModelWrapper::FromRawPointer(models_[env_id])) {
+      return py::cast(wrapper, py::return_value_policy::reference);
+    }
+
+    py::capsule owner(
+        new py::object(py::cast(this, py::return_value_policy::reference)),
+        nullptr, &KeepAlivePyObjectCapsuleDestructor);
+    return py::cast(
+        MjModelWrapper(models_[env_id], owner),
+        py::return_value_policy::move);
+  }
+
+  py::list get_models(const PyIArray env_ids) {
+    py::buffer_info index_info = env_ids.request();
+    if (index_info.ndim != 1) {
+      throw py::value_error("env_ids must be a 1-D array");
+    }
+
+    py::list out;
+    const int* index_ptr = static_cast<const int*>(index_info.ptr);
+    int n = static_cast<int>(index_info.shape[0]);
+    for (int i = 0; i < n; ++i) {
+      out.append(get_model(index_ptr[i]));
+    }
+    return out;
+  }
+
+  py::list get_all_models() {
+    py::list out;
+    for (int env_id = 0; env_id < nbatch_; ++env_id) {
+      out.append(get_model(env_id));
+    }
+    return out;
+  }
+
   // Return a read-only view of the given model's field as a 1-D numpy array.
   // Intended for tests. The returned array shares memory with the pool and
   // must not be mutated by the caller.
@@ -1036,6 +1078,9 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("randomization") = py::none(),
            py::arg("initial_warmstart") = py::none(),
            py::arg("skipsensor") = false, py::arg("chunk_size") = py::none())
+      .def("get_model", &BatchEnvPool::get_model, py::arg("env_id"))
+      .def("get_models", &BatchEnvPool::get_models, py::arg("env_ids"))
+      .def("get_all_models", &BatchEnvPool::get_all_models)
       .def("get_field", &BatchEnvPool::get_field, py::arg("env_id"),
            py::arg("name"))
       .def("get_field_indexed", &BatchEnvPool::get_field_indexed,

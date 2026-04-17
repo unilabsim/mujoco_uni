@@ -131,6 +131,23 @@ class BatchEnvPool:
   def nsensordata(self) -> int:
     return self._pool.nsensordata
 
+  def get_all_models(self) -> list[mujoco.MjModel]:
+    """Return references to all pool-owned models without copying."""
+    if self._pool is None:
+      raise RuntimeError("get_all_models requested after pool close")
+    return self._pool.get_all_models()
+
+  def get_model(
+      self, env_ids: int | Sequence[int]
+  ) -> mujoco.MjModel | list[mujoco.MjModel]:
+    """Return one or more pool-owned model references without copying."""
+    if self._pool is None:
+      raise RuntimeError("get_model requested after pool close")
+    env_ids_arr, scalar_index = _normalize_indices(env_ids)
+    if scalar_index:
+      return self._pool.get_model(int(env_ids_arr[0]))
+    return self._pool.get_models(env_ids_arr)
+
   # -- step -----------------------------------------------------------
   def step(
       self,
