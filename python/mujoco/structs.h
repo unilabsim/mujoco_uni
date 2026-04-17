@@ -487,6 +487,9 @@ class MjWrapper<raw::MjModel> : public WrapperBase<raw::MjModel> {
   MjWrapper(const MjWrapper&);
   MjWrapper(MjWrapper&&);
 
+  // `ptr` is owned by `owner`.
+  MjWrapper(raw::MjModel* ptr, pybind11::handle owner);
+
   // Takes ownership of the raw mjModel pointer.
   explicit MjWrapper(raw::MjModel* ptr);
 

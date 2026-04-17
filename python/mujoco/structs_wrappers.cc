@@ -224,6 +224,27 @@ MjModelWrapper* MjModelWrapper::FromRawPointer(raw::MjModel* m) noexcept {
 #define MJ_M(x) ptr_->x
 #define X(dtype, var, dim0, dim1) \
   , var(InitPyArray(X_ARRAY_SHAPE(ptr_->dim0, dim1), ptr_->var, owner_))
+MjModelWrapper::MjWrapper(raw::MjModel* ptr, py::handle owner)
+    : WrapperBase(ptr, owner),
+      opt(&ptr->opt, owner_),
+      vis(&ptr->vis, owner_),
+      stat(&ptr->stat, owner_) MJMODEL_POINTERS,
+      text_data_bytes(ptr->text_data, ptr->ntextdata),
+      names_bytes(ptr->names, ptr->nnames),
+      paths_bytes(ptr->paths, ptr->npaths),
+      indexer_(ptr, owner_) {
+  bool is_newly_inserted = false;
+  {
+    py::gil_scoped_acquire gil;
+    is_newly_inserted = MjModelRawPointerMap().insert({ptr_, this}).second;
+  }
+  if (!is_newly_inserted) {
+    throw UnexpectedError(
+        "MjModelWrapper(mjModel*, owner): MjModelRawPointerMap already "
+        "contains this raw mjModel*");
+  }
+}
+
 MjModelWrapper::MjWrapper(raw::MjModel* ptr)
     : WrapperBase(ptr, &MjModelCapsuleDestructor),
       opt(&ptr->opt, owner_),
