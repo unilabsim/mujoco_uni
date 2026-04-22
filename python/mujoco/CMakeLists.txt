@@ -438,7 +438,7 @@ mujoco_pybind11_module(_rollout rollout.cc threadpool.cc)
 target_link_libraries(_rollout PRIVATE functions_header mujoco raw)
 
 mujoco_pybind11_module(_batch_env batch_env.cc threadpool.cc)
-target_link_libraries(_batch_env PRIVATE functions_header mujoco raw)
+target_link_libraries(_batch_env PRIVATE functions_header mujoco raw structs_wrappers)
 
 mujoco_pybind11_module(
   _structs
