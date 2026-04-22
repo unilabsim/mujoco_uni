@@ -406,6 +406,29 @@ generate_binding_sources() {
     > "${python_root}/mujoco/specs.cc.inc"
 }
 
+run_batch_env_smoke() {
+  local python_bin="$1"
+  "${python_bin}" - <<'PY'
+import mujoco
+from mujoco.batch_env import SUPPORTED_FIELDS
+
+assert "gravity" in SUPPORTED_FIELDS, SUPPORTED_FIELDS
+print("mujoco", mujoco.__version__)
+print("batch_env fields", sorted(SUPPORTED_FIELDS))
+PY
+}
+
+smoke_wheel_for_python() {
+  local python_bin="$1"
+  local wheel_path="$2"
+  local smoke_env_dir="${build_root}/smoke-venvs/$(basename "${python_bin}")-$(basename "${wheel_path}")"
+
+  rm -rf "${smoke_env_dir}"
+  uv venv --python "${python_bin}" "${smoke_env_dir}"
+  uv pip install --python "${smoke_env_dir}/bin/python" --no-deps "${wheel_path}"
+  run_batch_env_smoke "${smoke_env_dir}/bin/python"
+}
+
 build_one_abi() {
   local abi="$1"
   local cmake_parallel_level="$2"
@@ -445,6 +468,7 @@ build_one_abi() {
     "${env_python}" -m build --wheel --no-isolation
   )
 
+  smoke_wheel_for_python "${pybin}" "${worker_python_root}"/dist/*.whl
   cp -f "${worker_python_root}"/dist/*.whl "${wheels_dir}/"
 }
 
