@@ -110,6 +110,7 @@ FIELD_COMPONENT_WIDTHS = {
     "body_iquat": 4,
     "body_inertia": 3,
     "dof_armature": 1,
+    "gravity": 3,
     "geom_friction": 3,
     "kp": 1,
     "kd": 1,
@@ -128,6 +129,8 @@ def _field_index_count(model, name):
     return model.nbody
   if name == "dof_armature":
     return model.nv
+  if name == "gravity":
+    return 1
   if name == "geom_friction":
     return model.ngeom
   if name in ("kp", "kd"):
@@ -178,6 +181,11 @@ def _set_model_field_indexed(model, name, indices, values):
     model.body_inertia[indices] = values
   elif name == "dof_armature":
     model.dof_armature[indices] = values
+  elif name == "gravity":
+    for idx, val in zip(indices, values.reshape(-1, 3)):
+      if idx != 0:
+        raise ValueError("gravity only supports index 0")
+      model.opt.gravity[:] = val
   elif name == "geom_friction":
     model.geom_friction[indices] = values
   elif name == "kp":
@@ -312,6 +320,7 @@ class ConstructorTest(absltest.TestCase):
             "body_iquat",
             "body_inertia",
             "dof_armature",
+            "gravity",
             "geom_friction",
             "kp",
             "kd",
@@ -514,6 +523,43 @@ class PatchingTest(parameterized.TestCase):
       np.testing.assert_array_equal(pool.get_field(0, "body_inertia"), original)
       np.testing.assert_array_equal(pool.get_field(2, "body_inertia"), original)
 
+  def test_gravity_target_only(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
+    with batch_env.BatchEnvPool(model, nbatch=4, nthread=0) as pool:
+      original = pool.get_field(0, "gravity").copy()
+      new_gravity = np.array(
+          [
+              [0.0, -3.0, -6.0],
+              [4.0, 0.0, -12.0],
+          ],
+          dtype=np.float64,
+      )
+      env_ids = np.array([1, 3], dtype=np.int32)
+      init = _rand_state(model, 2, self.rng)
+      pool.reset(env_ids, init, randomization={"gravity": new_gravity})
+      np.testing.assert_allclose(pool.get_field(1, "gravity"), new_gravity[0])
+      np.testing.assert_allclose(pool.get_field(3, "gravity"), new_gravity[1])
+      np.testing.assert_array_equal(pool.get_field(0, "gravity"), original)
+      np.testing.assert_array_equal(pool.get_field(2, "gravity"), original)
+
+  def test_gravity_reset_matches_reference_without_setconst(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    ref_model = mujoco.MjModel.from_xml_string(TEST_XML)
+    new_gravity = np.array([0.5, -1.0, -6.25], dtype=np.float64)
+    ref_model.opt.gravity[:] = new_gravity
+
+    init = _rand_state(model, 1, self.rng)
+    ref_out, ref_sensor = _reference_forward(ref_model, init[0])
+
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=0) as pool:
+      state, sensor = pool.reset(
+          env_ids=np.array([0], dtype=np.int32),
+          initial_state=init,
+          randomization={"gravity": new_gravity.reshape(1, -1)},
+      )
+    np.testing.assert_allclose(state[0], ref_out, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sensor[0], ref_sensor, atol=1e-12, rtol=0)
+
   def test_refresh_field_dynamics(self):
     model = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
     ref_model = mujoco.MjModel.from_xml_string(TEST_XML_FREE)
@@ -633,7 +679,12 @@ class IndexedFieldTest(parameterized.TestCase):
   @parameterized.parameters(*batch_env.SUPPORTED_FIELDS)
   def test_set_field_indexed_many_target_only(self, field_name):
     model = mujoco.MjModel.from_xml_string(TEST_XML)
-    indices = np.array([0, _field_index_count(model, field_name) - 1], dtype=np.int32)
+    index_count = _field_index_count(model, field_name)
+    indices = (
+        np.array([0], dtype=np.int32)
+        if index_count == 1
+        else np.array([0, index_count - 1], dtype=np.int32)
+    )
     with batch_env.BatchEnvPool(model, nbatch=2, nthread=0) as pool:
       original_other = pool.get_field(0, field_name).copy()
       original_target = _field_entries(pool, 1, field_name, model).copy()
