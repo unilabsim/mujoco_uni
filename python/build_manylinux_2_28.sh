@@ -28,8 +28,8 @@ Examples:
   bash python/build_manylinux_2_28.sh
   bash python/build_manylinux_2_28.sh --python 3.10 --python 3.12
 
-This reuses a fixed manylinux_2_28 container so Linux wheels can be built,
-retagged, and later uploaded together with host-built sdists.
+This reuses a fixed manylinux_2_28 container, creates uv-managed build envs,
+and builds the requested Python wheels in parallel.
 EOF
 }
 
@@ -195,7 +195,7 @@ prepare_workspace_permissions() {
     set -euo pipefail
     cd /work/python
     shopt -s nullglob
-    targets=(build dist dist_all_manylinux_2_27 ./*.egg-info)
+    targets=(build dist .release-uv ./*.egg-info)
     for target in \"\${targets[@]}\"; do
       [[ -e \"\${target}\" ]] || continue
       chown -R ${host_uid}:${host_gid} \"\${target}\" 2>/dev/null || true
@@ -233,12 +233,14 @@ HOST_GID="$(id -g)"
 CONTAINER_HOME="/tmp/mujoco-uni-home-${HOST_UID}"
 CONTAINER_CACHE_HOME="${CONTAINER_HOME}/.cache"
 CONTAINER_PIP_CACHE_DIR="${CONTAINER_CACHE_HOME}/pip"
+CONTAINER_UV_CACHE_DIR="${CONTAINER_CACHE_HOME}/uv"
 
 "${RUNTIME}" exec \
   -u "${HOST_UID}:${HOST_GID}" \
   -e HOME="${CONTAINER_HOME}" \
   -e XDG_CACHE_HOME="${CONTAINER_CACHE_HOME}" \
   -e PIP_CACHE_DIR="${CONTAINER_PIP_CACHE_DIR}" \
+  -e UV_CACHE_DIR="${CONTAINER_UV_CACHE_DIR}" \
   -e PIP_DISABLE_PIP_VERSION_CHECK=1 \
   -e MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-}" \
   "${CONTAINER_NAME}" \
@@ -249,13 +251,18 @@ cd /work/python
 export HOME="${HOME:-/tmp/mujoco-uni-home}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${XDG_CACHE_HOME}/pip}"
-mkdir -p "${HOME}" "${XDG_CACHE_HOME}" "${PIP_CACHE_DIR}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-${XDG_CACHE_HOME}/uv}"
+mkdir -p "${HOME}" "${XDG_CACHE_HOME}" "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
 
-mkdir -p /tmp/mujoco-uni-manylinux-build
-preserve_dir=/tmp/mujoco-uni-manylinux-build/preserve-dist
-wheels_dir=/tmp/mujoco-uni-manylinux-build/wheels
-rm -rf "${preserve_dir}" "${wheels_dir}"
-mkdir -p "${preserve_dir}" "${wheels_dir}"
+build_root=/tmp/mujoco-uni-manylinux-build
+preserve_dir="${build_root}/preserve-dist"
+wheels_dir="${build_root}/wheels"
+logs_dir="${build_root}/logs"
+venvs_dir="${build_root}/venvs"
+workspaces_dir="${build_root}/workspaces"
+bootstrap_dir="${build_root}/uv-bootstrap"
+rm -rf "${preserve_dir}" "${wheels_dir}" "${logs_dir}" "${venvs_dir}" "${workspaces_dir}"
+mkdir -p "${preserve_dir}" "${wheels_dir}" "${logs_dir}" "${venvs_dir}" "${workspaces_dir}"
 
 if [[ -d dist ]]; then
   shopt -s nullglob
@@ -270,26 +277,215 @@ if [[ -d dist ]]; then
   shopt -u nullglob
 fi
 
-for abi in "$@"; do
-  pybin="/opt/python/${abi}/bin/python"
+get_upstream_version() {
+  awk -F'"' '/^version = / {print $2; exit}' /work/python/pyproject.toml | cut -d. -f1-3
+}
+
+get_cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    getconf _NPROCESSORS_ONLN 2>/dev/null || printf '%s\n' 1
+  fi
+}
+
+recommended_cmake_parallel_level() {
+  local job_count="$1"
+  local cpu_count
+  local level
+
+  cpu_count="$(get_cpu_count)"
+  if [[ -z "${cpu_count}" || "${cpu_count}" -lt 1 ]]; then
+    cpu_count=1
+  fi
+  level=$((cpu_count / job_count))
+  if [[ "${level}" -lt 1 ]]; then
+    level=1
+  fi
+  printf '%s\n' "${level}"
+}
+
+is_python_path() {
+  case "${1:-}" in
+    /*|./*|../*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_uv_available() {
+  local bootstrap_python="$1"
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[info] bootstrapping uv inside container"
+  rm -rf "${bootstrap_dir}"
+  "${bootstrap_python}" -m venv "${bootstrap_dir}"
+  "${bootstrap_dir}/bin/python" -m pip install --quiet --upgrade pip uv
+  export PATH="${bootstrap_dir}/bin:${PATH}"
+}
+
+setup_uv_env() {
+  local python_spec="$1"
+  local env_dir="$2"
+  shift 2
+
+  if ! is_python_path "${python_spec}"; then
+    uv python install "${python_spec}"
+  fi
+
+  rm -rf "${env_dir}"
+  uv venv --python "${python_spec}" "${env_dir}"
+  uv pip install --python "${env_dir}/bin/python" --upgrade "$@"
+}
+
+get_installed_mujoco_site() {
+  local python_bin="$1"
+  "${python_bin}" -c 'from importlib.metadata import distribution; import pathlib; print(pathlib.Path(distribution("mujoco").locate_file("mujoco")).resolve())'
+}
+
+copy_release_workspace() {
+  local target_repo_root="$1"
+  mkdir -p "${target_repo_root}"
+  tar -C /work \
+    --exclude='./.git' \
+    --exclude='./python/dist' \
+    --exclude='./python/build' \
+    --exclude='./python/.release-uv' \
+    --exclude='./python/*.egg-info' \
+    -cf - . | tar -C "${target_repo_root}" -xf -
+}
+
+cleanup_bundled_assets() {
+  local python_root="$1"
+  local bundle_dir="${python_root}/mujoco"
+  rm -rf "${bundle_dir}/include" "${bundle_dir}/plugin" "${bundle_dir}/cmake" "${bundle_dir}/simulate"
+  rm -f "${bundle_dir}"/libmujoco*.dylib "${bundle_dir}"/libmujoco*.so*
+}
+
+prepare_bundled_assets() {
+  local repo_root="$1"
+  local python_root="$2"
+  local mujoco_site="$3"
+  local bundle_dir="${python_root}/mujoco"
+  local bundle_file
+
+  cleanup_bundled_assets "${python_root}"
+  mkdir -p "${bundle_dir}/include/mujoco" "${bundle_dir}/plugin" "${bundle_dir}/cmake"
+  cp -f "${repo_root}"/cmake/*.cmake "${bundle_dir}/cmake/" 2>/dev/null || true
+  cp -rf "${repo_root}"/simulate "${bundle_dir}/" 2>/dev/null || true
+  for bundle_file in "${mujoco_site}"/libmujoco*.dylib "${mujoco_site}"/libmujoco*.so*; do
+    [[ -e "${bundle_file}" ]] && cp -f "${bundle_file}" "${bundle_dir}/"
+  done
+  if [[ -d "${mujoco_site}/include/mujoco" ]]; then
+    cp -f "${mujoco_site}/include/mujoco/"*.h "${bundle_dir}/include/mujoco/" 2>/dev/null || true
+  fi
+  if [[ -d "${mujoco_site}/plugin" ]]; then
+    cp -f "${mujoco_site}/plugin/"* "${bundle_dir}/plugin/" 2>/dev/null || true
+  fi
+}
+
+generate_binding_sources() {
+  local python_root="$1"
+  local python_bin="$2"
+
+  PYTHONPATH="${python_root}/mujoco" \
+  "${python_bin}" "${python_root}/mujoco/codegen/generate_enum_traits.py" \
+    > "${python_root}/mujoco/enum_traits.h"
+
+  PYTHONPATH="${python_root}/mujoco" \
+  "${python_bin}" "${python_root}/mujoco/codegen/generate_function_traits.py" \
+    > "${python_root}/mujoco/function_traits.h"
+
+  PYTHONPATH="${python_root}/mujoco" \
+  "${python_bin}" "${python_root}/mujoco/codegen/generate_spec_bindings.py" \
+    > "${python_root}/mujoco/specs.cc.inc"
+}
+
+build_one_abi() {
+  local abi="$1"
+  local cmake_parallel_level="$2"
+  local pybin="/opt/python/${abi}/bin/python"
+  local env_dir="${venvs_dir}/${abi}"
+  local worker_repo_root="${workspaces_dir}/${abi}"
+  local worker_python_root="${worker_repo_root}/python"
+  local env_python
+  local mujoco_site
+  local worker_cmake_args
+
   if [[ ! -x "${pybin}" ]]; then
     echo "[error] missing interpreter: ${pybin}" >&2
     exit 1
   fi
 
-  venv="/tmp/venv-${abi}"
-  rm -rf "${venv}"
-  "${pybin}" -m venv "${venv}"
-  # shellcheck disable=SC1090
-  source "${venv}/bin/activate"
+  setup_uv_env "${pybin}" "${env_dir}" build setuptools wheel absl-py "mujoco==${UPSTREAM_VERSION}"
+  env_python="${env_dir}/bin/python"
+  mujoco_site="$(get_installed_mujoco_site "${env_python}")"
 
-  python -m pip install --upgrade pip
-  export MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=bfd"
-  bash release.sh --wheel-only --no-auto-conda
-  mv dist/*.whl "${wheels_dir}/"
+  rm -rf "${worker_repo_root}"
+  copy_release_workspace "${worker_repo_root}"
+  rm -rf "${worker_python_root}/dist" "${worker_python_root}/build" "${worker_python_root}"/*.egg-info
+  prepare_bundled_assets "${worker_repo_root}" "${worker_python_root}" "${mujoco_site}"
+  generate_binding_sources "${worker_python_root}" "${env_python}"
 
-  deactivate
+  worker_cmake_args="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
+
+  (
+    cd "${worker_python_root}"
+    export MUJOCO_PATH="${mujoco_site}"
+    export MUJOCO_PLUGIN_PATH="${mujoco_site}/plugin"
+    export MUJOCO_CMAKE_ARGS="${worker_cmake_args}"
+    if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+      export CMAKE_BUILD_PARALLEL_LEVEL="${cmake_parallel_level}"
+    fi
+    "${env_python}" -m build --wheel --no-isolation
+  )
+
+  cp -f "${worker_python_root}"/dist/*.whl "${wheels_dir}/"
+}
+
+UPSTREAM_VERSION="$(get_upstream_version)"
+cmake_parallel_level="$(recommended_cmake_parallel_level "$#")"
+first_pybin="/opt/python/$1/bin/python"
+ensure_uv_available "${first_pybin}"
+
+echo "[info] upstream version: ${UPSTREAM_VERSION}"
+echo "[info] per-wheel CMake parallel level: ${cmake_parallel_level}"
+echo "[info] building ABIs in parallel: $*"
+
+declare -a pids=()
+declare -a labels=()
+
+for abi in "$@"; do
+  log_file="${logs_dir}/${abi}.log"
+  (
+    if build_one_abi "${abi}" "${cmake_parallel_level}" >"${log_file}" 2>&1; then
+      echo "[done] ${abi} wheel built"
+    else
+      echo "[error] ${abi} wheel failed" >&2
+      cat "${log_file}" >&2
+      exit 1
+    fi
+  ) &
+  pids+=("$!")
+  labels+=("${abi}")
 done
+
+build_failed=0
+for index in "${!pids[@]}"; do
+  if ! wait "${pids[$index]}"; then
+    echo "[error] ${labels[$index]} build did not complete" >&2
+    build_failed=1
+  fi
+done
+
+if [[ "${build_failed}" -ne 0 ]]; then
+  exit 1
+fi
 
 rm -rf dist
 mkdir -p dist
