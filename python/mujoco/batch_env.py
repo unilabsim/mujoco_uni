@@ -41,6 +41,7 @@ _FIELD_COMPONENT_WIDTHS = {
     "body_iquat": 4,
     "body_inertia": 3,
     "dof_armature": 1,
+    "gravity": 3,
     "geom_friction": 3,
     "kp": 1,
     "kd": 1,
