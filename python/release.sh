@@ -508,6 +508,7 @@ build_wheel_for_python_spec() {
     "$env_python" -m build --wheel --no-isolation
   )
 
+  smoke_wheel_for_python_spec "$python_spec" "${worker_python_root}"/dist/*.whl
   cp -f "${worker_python_root}"/dist/*.whl "$wheels_dir/"
 }
 
@@ -572,6 +573,34 @@ build_host_wheels_parallel() {
   cp -f "${built_wheels[@]}" "${ROOT_DIR}/dist/"
 }
 
+run_batch_env_smoke() {
+  local python_bin="$1"
+  "${python_bin}" - <<'PY'
+import mujoco
+from mujoco.batch_env import SUPPORTED_FIELDS
+
+assert "gravity" in SUPPORTED_FIELDS, SUPPORTED_FIELDS
+print("mujoco", mujoco.__version__)
+print("batch_env fields", sorted(SUPPORTED_FIELDS))
+PY
+}
+
+smoke_wheel_for_python_spec() {
+  local python_spec="$1"
+  local wheel_path="$2"
+  local tmp_venv
+  local status
+
+  tmp_venv="$(mktemp -d)"
+
+  uv venv --python "$python_spec" "${tmp_venv}/venv"
+  uv pip install --python "${tmp_venv}/venv/bin/python" --no-deps "$wheel_path"
+  run_batch_env_smoke "${tmp_venv}/venv/bin/python"
+  status=$?
+  rm -rf "$tmp_venv"
+  return "$status"
+}
+
 run_smoke_testpypi() {
   local tmp_venv
   tmp_venv="$(mktemp -d)"
@@ -580,7 +609,7 @@ run_smoke_testpypi() {
     -i https://test.pypi.org/simple/ \
     --extra-index-url https://pypi.org/simple \
     "mujoco-uni==${VERSION}"
-  "${tmp_venv}/venv/bin/python" -c "import mujoco; print(mujoco.__version__)"
+  run_batch_env_smoke "${tmp_venv}/venv/bin/python"
   rm -rf "$tmp_venv"
 }
 
