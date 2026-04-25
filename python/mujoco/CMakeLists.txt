@@ -39,6 +39,40 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
+option(
+  MUJOCO_PYTHON_USE_LIBCXX
+  "Build Linux Python bindings against libc++ to match official MuJoCo wheels."
+  OFF
+)
+set(MUJOCO_PYTHON_LIBCXX_ROOT "" CACHE PATH "Path to a libc++ install prefix.")
+if(MUJOCO_PYTHON_USE_LIBCXX)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "MUJOCO_PYTHON_USE_LIBCXX is only supported on Linux")
+  endif()
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "MUJOCO_PYTHON_USE_LIBCXX requires clang++")
+  endif()
+  set(MUJOCO_PYTHON_LIBCXX_COMPILE_FLAGS "-stdlib=libc++")
+  set(MUJOCO_PYTHON_LIBCXX_LINK_FLAGS "-stdlib=libc++ -static-libstdc++")
+  if(MUJOCO_PYTHON_LIBCXX_ROOT)
+    set(
+      MUJOCO_PYTHON_LIBCXX_COMPILE_FLAGS
+      "${MUJOCO_PYTHON_LIBCXX_COMPILE_FLAGS} -isystem ${MUJOCO_PYTHON_LIBCXX_ROOT}/include/c++/v1"
+    )
+    set(
+      MUJOCO_PYTHON_LIBCXX_LINK_FLAGS
+      "-stdlib=libc++ -nostdlib++ -pthread -Wl,--whole-archive ${MUJOCO_PYTHON_LIBCXX_ROOT}/lib/libc++.a ${MUJOCO_PYTHON_LIBCXX_ROOT}/lib/libc++abi.a ${MUJOCO_PYTHON_LIBCXX_ROOT}/lib/libunwind.a -Wl,--no-whole-archive -ldl"
+    )
+  endif()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MUJOCO_PYTHON_LIBCXX_COMPILE_FLAGS}")
+  set(CMAKE_MODULE_LINKER_FLAGS
+      "${CMAKE_MODULE_LINKER_FLAGS} ${MUJOCO_PYTHON_LIBCXX_LINK_FLAGS}"
+  )
+  set(CMAKE_EXE_LINKER_FLAGS
+      "${CMAKE_EXE_LINKER_FLAGS} ${MUJOCO_PYTHON_LIBCXX_LINK_FLAGS}"
+  )
+endif()
+
 # TODO(stunya) Figure out why this is required.
 separate_arguments(CMDLINE_LINK_OPTIONS UNIX_COMMAND ${CMAKE_SHARED_LINKER_FLAGS})
 add_link_options(${CMDLINE_LINK_OPTIONS})
