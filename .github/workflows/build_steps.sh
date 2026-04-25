@@ -20,6 +20,9 @@
 prepare_linux() {
     echo "Preparing Linux..."
     sudo apt-get update && sudo apt-get install \
+        clang \
+        libc++-dev \
+        libc++abi-dev \
         libgl1-mesa-dev \
         libwayland-dev \
         libxinerama-dev \

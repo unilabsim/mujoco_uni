@@ -21,6 +21,29 @@ TMP_WORK_ROOT=""
 USER_MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-}"
 ALL_PYTHON_SPECS=(3.10 3.11 3.12 3.13)
 
+linux_libcxx_python_cmake_args() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+
+  local args=" -DMUJOCO_PYTHON_USE_LIBCXX:BOOL=ON -DCMAKE_C_COMPILER:STRING=${MUJOCO_LINUX_C_COMPILER:-clang} -DCMAKE_CXX_COMPILER:STRING=${MUJOCO_LINUX_CXX_COMPILER:-clang++}"
+  local ar_bin="${MUJOCO_LINUX_AR:-}"
+  local ranlib_bin="${MUJOCO_LINUX_RANLIB:-}"
+  if [[ -z "$ar_bin" ]]; then
+    ar_bin="$(command -v llvm-ar || command -v ar || true)"
+  fi
+  if [[ -z "$ranlib_bin" ]]; then
+    ranlib_bin="$(command -v llvm-ranlib || command -v ranlib || true)"
+  fi
+  if [[ -n "$ar_bin" && -n "$ranlib_bin" ]]; then
+    args="${args} -DCMAKE_AR:FILEPATH=${ar_bin} -DCMAKE_RANLIB:FILEPATH=${ranlib_bin} -DCMAKE_CXX_COMPILER_AR:FILEPATH=${ar_bin} -DCMAKE_CXX_COMPILER_RANLIB:FILEPATH=${ranlib_bin}"
+  fi
+  if [[ -n "${MUJOCO_PYTHON_LIBCXX_ROOT:-}" ]]; then
+    args="${args} -DMUJOCO_PYTHON_LIBCXX_ROOT:PATH=${MUJOCO_PYTHON_LIBCXX_ROOT}"
+  fi
+  printf '%s' "${args}"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -495,7 +518,7 @@ build_wheel_for_python_spec() {
   copy_release_workspace "$worker_repo_root"
   rm -rf "${worker_python_root}/dist" "${worker_python_root}/build" "${worker_python_root}"/*.egg-info
 
-  worker_cmake_args="${USER_MUJOCO_CMAKE_ARGS:-} -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
+  worker_cmake_args="${USER_MUJOCO_CMAKE_ARGS:-}$(linux_libcxx_python_cmake_args) -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
 
   (
     cd "$worker_python_root"
@@ -506,7 +529,7 @@ build_wheel_for_python_spec() {
       export CMAKE_BUILD_PARALLEL_LEVEL="$cmake_parallel_level"
     fi
     "$env_python" -m build --wheel --no-isolation
-  )
+  ) || return
 
   smoke_wheel_for_python_spec "$python_spec" "${worker_python_root}"/dist/*.whl
   cp -f "${worker_python_root}"/dist/*.whl "$wheels_dir/"
@@ -580,6 +603,10 @@ import mujoco
 from mujoco.batch_env import SUPPORTED_FIELDS
 
 assert "gravity" in SUPPORTED_FIELDS, SUPPORTED_FIELDS
+spec = mujoco.MjSpec()
+body = spec.worldbody.add_body()
+body.name = "abi_ok"
+assert body.name == "abi_ok", body.name
 print("mujoco", mujoco.__version__)
 print("batch_env fields", sorted(SUPPORTED_FIELDS))
 PY
@@ -652,7 +679,7 @@ MUJOCO_SITE="$(get_installed_mujoco_site "$CONTROL_PYTHON")"
 
 export MUJOCO_PATH="${MUJOCO_SITE}"
 export MUJOCO_PLUGIN_PATH="${MUJOCO_SITE}/plugin"
-export MUJOCO_CMAKE_ARGS="${USER_MUJOCO_CMAKE_ARGS:-} -DCMAKE_MODULE_PATH:PATH=${MUJOCO_REPO_ROOT}/cmake;${ROOT_DIR}/mujoco/cmake"
+export MUJOCO_CMAKE_ARGS="${USER_MUJOCO_CMAKE_ARGS:-}$(linux_libcxx_python_cmake_args) -DCMAKE_MODULE_PATH:PATH=${MUJOCO_REPO_ROOT}/cmake;${ROOT_DIR}/mujoco/cmake"
 
 prepare_bundled_assets "$MUJOCO_SITE"
 generate_binding_sources

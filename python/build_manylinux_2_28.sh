@@ -169,12 +169,15 @@ ensure_container_exists() {
 install_container_deps_once() {
   "${RUNTIME}" exec "${CONTAINER_NAME}" /bin/bash -lc '
     set -euo pipefail
-    stamp=/tmp/mujoco-manylinux-228.deps.ready
+    stamp=/tmp/mujoco-manylinux-228.deps.libcxx.v2.ready
     if [[ -f "${stamp}" ]]; then
       exit 0
     fi
     if command -v dnf >/dev/null 2>&1; then
       dnf -y install \
+        clang \
+        llvm \
+        ninja-build \
         mesa-libGL-devel \
         wayland-devel \
         wayland-protocols-devel \
@@ -184,6 +187,50 @@ install_container_deps_once() {
         libXi-devel \
         libxkbcommon-devel >/dev/null
     fi
+    touch "${stamp}"
+  '
+}
+
+install_libcxx_once() {
+  "${RUNTIME}" exec "${CONTAINER_NAME}" /bin/bash -lc '
+    set -euo pipefail
+    version="${MUJOCO_LIBCXX_LLVM_VERSION:-18.1.8}"
+    prefix=/opt/mujoco-uni-libcxx
+    stamp="${prefix}/.pic-ready-${version}"
+    if [[ -f "${stamp}" ]]; then
+      exit 0
+    fi
+
+    work=/tmp/mujoco-uni-libcxx-build
+    src="${work}/llvm-project-${version}.src"
+    archive="${work}/llvm-project-${version}.src.tar.xz"
+    rm -rf "${work}"
+    mkdir -p "${work}" "${prefix}"
+
+    curl -fsSL \
+      "https://github.com/llvm/llvm-project/releases/download/llvmorg-${version}/llvm-project-${version}.src.tar.xz" \
+      -o "${archive}"
+    tar -C "${work}" -xf "${archive}"
+
+    cmake -S "${src}/runtimes" -B "${work}/build" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang \
+      -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_INSTALL_PREFIX="${prefix}" \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DLLVM_ENABLE_RUNTIMES="libcxx;libcxxabi;libunwind" \
+      -DLIBCXX_ENABLE_SHARED=OFF \
+      -DLIBCXX_ENABLE_STATIC=ON \
+      -DLIBCXXABI_ENABLE_SHARED=OFF \
+      -DLIBCXXABI_ENABLE_STATIC=ON \
+      -DLIBCXXABI_USE_LLVM_UNWINDER=ON \
+      -DLIBUNWIND_ENABLE_SHARED=OFF \
+      -DLIBUNWIND_ENABLE_STATIC=ON \
+      -DLIBCXX_INCLUDE_BENCHMARKS=OFF \
+      -DLIBCXX_INCLUDE_TESTS=OFF \
+      -DLIBCXXABI_INCLUDE_TESTS=OFF \
+      -DLIBUNWIND_INCLUDE_TESTS=OFF
+    cmake --build "${work}/build" --target install --parallel "$(nproc)"
     touch "${stamp}"
   '
 }
@@ -216,6 +263,7 @@ echo "[info] python ABIs: ${ABI_TAGS[*]}"
 
 ensure_container_exists "${IMAGE}"
 install_container_deps_once
+install_libcxx_once
 prepare_workspace_permissions "$(id -u)" "$(id -g)"
 
 if [[ "${FIX_PERMISSIONS_ONLY}" -eq 1 ]]; then
@@ -413,6 +461,10 @@ import mujoco
 from mujoco.batch_env import SUPPORTED_FIELDS
 
 assert "gravity" in SUPPORTED_FIELDS, SUPPORTED_FIELDS
+spec = mujoco.MjSpec()
+body = spec.worldbody.add_body()
+body.name = "abi_ok"
+assert body.name == "abi_ok", body.name
 print("mujoco", mujoco.__version__)
 print("batch_env fields", sorted(SUPPORTED_FIELDS))
 PY
@@ -439,6 +491,8 @@ build_one_abi() {
   local env_python
   local mujoco_site
   local worker_cmake_args
+  local ar_bin
+  local ranlib_bin
 
   if [[ ! -x "${pybin}" ]]; then
     echo "[error] missing interpreter: ${pybin}" >&2
@@ -454,8 +508,10 @@ build_one_abi() {
   rm -rf "${worker_python_root}/dist" "${worker_python_root}/build" "${worker_python_root}"/*.egg-info
   prepare_bundled_assets "${worker_repo_root}" "${worker_python_root}" "${mujoco_site}"
   generate_binding_sources "${worker_python_root}" "${env_python}"
+  ar_bin="$(command -v llvm-ar || command -v ar)"
+  ranlib_bin="$(command -v llvm-ranlib || command -v ranlib)"
 
-  worker_cmake_args="${MUJOCO_CMAKE_ARGS:-} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
+  worker_cmake_args="${MUJOCO_CMAKE_ARGS:-} -DMUJOCO_PYTHON_USE_LIBCXX:BOOL=ON -DMUJOCO_PYTHON_LIBCXX_ROOT:PATH=/opt/mujoco-uni-libcxx -DCMAKE_C_COMPILER:STRING=clang -DCMAKE_CXX_COMPILER:STRING=clang++ -DCMAKE_AR:FILEPATH=${ar_bin} -DCMAKE_RANLIB:FILEPATH=${ranlib_bin} -DCMAKE_CXX_COMPILER_AR:FILEPATH=${ar_bin} -DCMAKE_CXX_COMPILER_RANLIB:FILEPATH=${ranlib_bin} -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=bfd -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
 
   (
     cd "${worker_python_root}"
@@ -466,7 +522,7 @@ build_one_abi() {
       export CMAKE_BUILD_PARALLEL_LEVEL="${cmake_parallel_level}"
     fi
     "${env_python}" -m build --wheel --no-isolation
-  )
+  ) || return
 
   smoke_wheel_for_python "${pybin}" "${worker_python_root}"/dist/*.whl
   cp -f "${worker_python_root}"/dist/*.whl "${wheels_dir}/"
