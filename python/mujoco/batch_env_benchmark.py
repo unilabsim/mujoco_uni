@@ -61,6 +61,31 @@ BENCH_XML = r"""
 """
 
 
+def _normalize_models(model_or_models, nbatch):
+  if isinstance(model_or_models, mujoco.MjModel):
+    return [model_or_models] * nbatch
+  models = list(model_or_models)
+  if len(models) == 1:
+    return models * nbatch
+  if len(models) != nbatch:
+    raise ValueError(
+        f"model sequence must have length 1 or nbatch={nbatch}, got {len(models)}"
+    )
+  return models
+
+
+def _make_model_sequence(model, nbatch):
+  models = [copy.copy(model) for _ in range(nbatch)]
+  for env_id, env_model in enumerate(models):
+    mass_scale = 1.0 + 0.01 * env_id
+    friction_scale = 1.0 + 0.005 * env_id
+    env_model.body_mass[:] *= mass_scale
+    env_model.geom_friction[:] *= friction_scale
+    data = mujoco.MjData(env_model)
+    mujoco.mj_setConst(env_model, data)
+  return models
+
+
 def _time_it(fn, warmup: int, repeat: int) -> float:
   """Return median seconds per call."""
   for _ in range(warmup):
@@ -73,17 +98,22 @@ def _time_it(fn, warmup: int, repeat: int) -> float:
   return float(np.median(samples))
 
 
-def bench_full_rollout(model, nbatch, nthread, nstep, warmup, repeat, rng):
-  nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+def bench_full_rollout(
+    model_or_models, nbatch, nthread, nstep, warmup, repeat, rng, label
+):
+  models = _normalize_models(model_or_models, nbatch)
+  nstate = mujoco.mj_stateSize(
+      models[0], mujoco.mjtState.mjSTATE_FULLPHYSICS
+  )
   state0 = rng.standard_normal((nbatch, nstate)).astype(np.float64)
-  control = np.zeros((nbatch, nstep, model.nu), dtype=np.float64)
+  control = np.zeros((nbatch, nstep, models[0].nu), dtype=np.float64)
 
   # Stateless reference path — infers nthread from len(data).
-  ref_models = [copy.copy(model) for _ in range(nbatch)]
+  ref_models = [copy.copy(model) for model in models]
   ref_datas = (
-      [mujoco.MjData(model) for _ in range(nthread)]
+      [mujoco.MjData(models[0]) for _ in range(nthread)]
       if nthread > 0
-      else [mujoco.MjData(model)]
+      else [mujoco.MjData(models[0])]
   )
 
   def ref_call():
@@ -97,7 +127,7 @@ def bench_full_rollout(model, nbatch, nthread, nstep, warmup, repeat, rng):
   t_ref = _time_it(ref_call, warmup, repeat)
 
   with batch_env.BatchEnvPool(
-      model, nbatch=nbatch, nthread=nthread
+      model_or_models, nbatch=nbatch, nthread=nthread
   ) as pool:
     def pool_call():
       pool.step(
@@ -111,7 +141,7 @@ def bench_full_rollout(model, nbatch, nthread, nstep, warmup, repeat, rng):
   env_steps_per_sec_ref = nbatch * nstep / t_ref
   env_steps_per_sec_pool = nbatch * nstep / t_pool
   print(
-      f"[full rollout] nbatch={nbatch} nthread={nthread} nstep={nstep}"
+      f"[full rollout:{label}] nbatch={nbatch} nthread={nthread} nstep={nstep}"
   )
   print(
       f"  stateless: {t_ref*1e3:7.2f} ms/call, "
@@ -125,14 +155,19 @@ def bench_full_rollout(model, nbatch, nthread, nstep, warmup, repeat, rng):
   print(f"  pool/stateless ratio: {ratio:.3f}")
 
 
-def bench_reset_subset_scan(model, nbatch, nthread, warmup, repeat, rng):
-  nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
-  nresets = sorted({1, 8, 64, nbatch})
+def bench_reset_subset_scan(
+    model_or_models, nbatch, nthread, warmup, repeat, rng, label
+):
+  models = _normalize_models(model_or_models, nbatch)
+  nstate = mujoco.mj_stateSize(
+      models[0], mujoco.mjtState.mjSTATE_FULLPHYSICS
+  )
+  nresets = sorted(nreset for nreset in {1, 8, 64, nbatch} if nreset <= nbatch)
 
   with batch_env.BatchEnvPool(
-      model, nbatch=nbatch, nthread=nthread
+      model_or_models, nbatch=nbatch, nthread=nthread
   ) as pool:
-    print(f"[reset scan] nbatch={nbatch} nthread={nthread}")
+    print(f"[reset scan:{label}] nbatch={nbatch} nthread={nthread}")
     for nreset in nresets:
       env_ids = rng.choice(nbatch, size=nreset, replace=False).astype(np.int32)
       init = rng.standard_normal((nreset, nstate)).astype(np.float64)
@@ -206,6 +241,7 @@ def main():
 
   rng = np.random.default_rng(args.seed)
   model = mujoco.MjModel.from_xml_string(BENCH_XML)
+  model_sequence = _make_model_sequence(model, args.nbatch)
   print(
       f"model: nbody={model.nbody} nv={model.nv} "
       f"ngeom={model.ngeom} nsensordata={model.nsensordata}"
@@ -214,16 +250,49 @@ def main():
   bench_memory(model, args.nbatch)
   gc.collect()
   bench_full_rollout(
-      model, args.nbatch, args.nthread, args.nstep, args.warmup, args.repeat,
+      model,
+      args.nbatch,
+      args.nthread,
+      args.nstep,
+      args.warmup,
+      args.repeat,
       rng,
+      "single-model",
   )
   gc.collect()
   bench_reset_subset_scan(
-      model, args.nbatch, args.nthread, args.warmup, args.repeat, rng,
+      model,
+      args.nbatch,
+      args.nthread,
+      args.warmup,
+      args.repeat,
+      rng,
+      "single-model",
   )
   gc.collect()
   bench_patch_refresh(
       model, args.nbatch, args.nthread, args.warmup, args.repeat, rng,
+  )
+  gc.collect()
+  bench_full_rollout(
+      model_sequence,
+      args.nbatch,
+      args.nthread,
+      args.nstep,
+      args.warmup,
+      args.repeat,
+      rng,
+      "multi-model",
+  )
+  gc.collect()
+  bench_reset_subset_scan(
+      model_sequence,
+      args.nbatch,
+      args.nthread,
+      args.warmup,
+      args.repeat,
+      rng,
+      "multi-model",
   )
 
 

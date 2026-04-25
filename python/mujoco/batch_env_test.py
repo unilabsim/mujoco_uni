@@ -379,6 +379,30 @@ class StepTest(parameterized.TestCase):
             control_spec=int(mujoco.mjtState.mjSTATE_CTRL),
         )
 
+  def test_distinct_models_match_per_env_references(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_POSITION)
+    model1 = copy.copy(model0)
+    model1.actuator_gainprm[:, 0] = 25.0
+    model1.actuator_biasprm[:, 1] = -25.0
+    model1.actuator_biasprm[:, 2] = -3.0
+
+    nstate = mujoco.mj_stateSize(model0, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    state0 = np.zeros((2, nstate), dtype=np.float64)
+    control = np.full((2, 1, model0.nu), 0.5, dtype=np.float64)
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0) as pool:
+      state = pool.step(
+          state0,
+          nstep=1,
+          control_spec=int(mujoco.mjtState.mjSTATE_CTRL),
+          control=control,
+      )
+
+    ref0 = _reference_last_state(model0, state0[:1], control[:1])[0]
+    ref1 = _reference_last_state(model1, state0[:1], control[1:])[0]
+    np.testing.assert_allclose(state[0], ref0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(state[1], ref1, atol=1e-12, rtol=0)
+
 
 class ForwardTest(parameterized.TestCase):
 
@@ -400,6 +424,24 @@ class ForwardTest(parameterized.TestCase):
     for i in range(nbatch):
       _, ref_sensor = _reference_forward(model, state0[i])
       np.testing.assert_allclose(sensor[i], ref_sensor, atol=1e-12, rtol=0)
+
+  def test_distinct_models_match_per_env_references(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML)
+    model1 = copy.copy(model0)
+    model1.body_mass[:] *= 1.5
+    model1.body_ipos[1] += np.array([0.01, -0.02, 0.03], dtype=np.float64)
+    ref_data = mujoco.MjData(model1)
+    mujoco.mj_setConst(model1, ref_data)
+
+    state0 = _rand_state(model0, 2, self.rng)
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0) as pool:
+      sensor = pool.forward(state0)
+
+    _, ref_sensor0 = _reference_forward(model0, state0[0])
+    _, ref_sensor1 = _reference_forward(model1, state0[1])
+    np.testing.assert_allclose(sensor[0], ref_sensor0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sensor[1], ref_sensor1, atol=1e-12, rtol=0)
 
 
 class ResetTest(parameterized.TestCase):
@@ -456,6 +498,27 @@ class ResetTest(parameterized.TestCase):
             env_ids=np.array([0, 4], dtype=np.int32),
             initial_state=np.zeros((2, pool.nstate)),
         )
+
+  def test_distinct_models_match_per_env_references(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML)
+    model1 = copy.copy(model0)
+    model1.body_mass[:] *= 1.25
+    model1.body_iquat[4:8] = np.array([0.92387953, 0.0, 0.38268343, 0.0])
+    ref_data = mujoco.MjData(model1)
+    mujoco.mj_setConst(model1, ref_data)
+
+    env_ids = np.array([0, 1], dtype=np.int32)
+    init = _rand_state(model0, 2, self.rng)
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=0) as pool:
+      state, sensor = pool.reset(env_ids, init)
+
+    ref_state0, ref_sensor0 = _reference_forward(model0, init[0])
+    ref_state1, ref_sensor1 = _reference_forward(model1, init[1])
+    np.testing.assert_allclose(state[0], ref_state0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(state[1], ref_state1, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sensor[0], ref_sensor0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sensor[1], ref_sensor1, atol=1e-12, rtol=0)
 
 
 class PatchingTest(parameterized.TestCase):

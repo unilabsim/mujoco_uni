@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mujoco-uni"
-version = "3.6.0.post8"
+version = "3.7.0.post8"
 authors = [
     {name = "TATP-233"},
 ]
@@ -34,9 +34,9 @@ dynamic = ["readme", "scripts"]
 
 [project.urls]
 Homepage = "https://github.com/TATP-233/mujoco"
-Documentation = "https://mujoco.readthedocs.io/en/3.6.0"
+Documentation = "https://mujoco.readthedocs.io/en/3.7.0"
 Repository = "https://github.com/TATP-233/mujoco"
-Changelog = "https://mujoco.readthedocs.io/en/3.6.0/changelog.html"
+Changelog = "https://mujoco.readthedocs.io/en/3.7.0/changelog.html"
 
 [tool.setuptools]
 include-package-data = false

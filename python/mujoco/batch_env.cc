@@ -275,6 +275,114 @@ const FieldSpec* LookupField(const std::string& name) {
   return nullptr;
 }
 
+const raw::MjModel* CastMjModelOrThrow(py::handle obj, const char* arg_name,
+                                       std::optional<py::ssize_t> index =
+                                           std::nullopt) {
+  try {
+    return obj.cast<const MjModelWrapper*>()->get();
+  } catch (const py::cast_error&) {
+    std::ostringstream msg;
+    msg << arg_name;
+    if (index.has_value()) {
+      msg << "[" << *index << "]";
+    }
+    msg << " must be an MjModel";
+    throw py::type_error(msg.str());
+  }
+}
+
+bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
+  if (mj_stateSize(lhs, mjSTATE_FULLPHYSICS) !=
+      mj_stateSize(rhs, mjSTATE_FULLPHYSICS)) {
+    return false;
+  }
+
+#define MJ_MODEL_FIELD_EQ(name) \
+  if (lhs->name != rhs->name) return false
+  MJ_MODEL_FIELD_EQ(nq);
+  MJ_MODEL_FIELD_EQ(nv);
+  MJ_MODEL_FIELD_EQ(na);
+  MJ_MODEL_FIELD_EQ(nu);
+  MJ_MODEL_FIELD_EQ(nbody);
+  MJ_MODEL_FIELD_EQ(nbvh);
+  MJ_MODEL_FIELD_EQ(nbvhdynamic);
+  MJ_MODEL_FIELD_EQ(njnt);
+  MJ_MODEL_FIELD_EQ(nM);
+  MJ_MODEL_FIELD_EQ(nC);
+  MJ_MODEL_FIELD_EQ(nD);
+  MJ_MODEL_FIELD_EQ(ngeom);
+  MJ_MODEL_FIELD_EQ(nsite);
+  MJ_MODEL_FIELD_EQ(ncam);
+  MJ_MODEL_FIELD_EQ(nlight);
+  MJ_MODEL_FIELD_EQ(nflexvert);
+  MJ_MODEL_FIELD_EQ(nflexedge);
+  MJ_MODEL_FIELD_EQ(nflexelem);
+  MJ_MODEL_FIELD_EQ(nJfe);
+  MJ_MODEL_FIELD_EQ(nJfv);
+  MJ_MODEL_FIELD_EQ(neq);
+  MJ_MODEL_FIELD_EQ(ntendon);
+  MJ_MODEL_FIELD_EQ(nJten);
+  MJ_MODEL_FIELD_EQ(nwrap);
+  MJ_MODEL_FIELD_EQ(nsensordata);
+  MJ_MODEL_FIELD_EQ(nmocap);
+  MJ_MODEL_FIELD_EQ(nplugin);
+  MJ_MODEL_FIELD_EQ(ntree);
+  MJ_MODEL_FIELD_EQ(nhistory);
+  MJ_MODEL_FIELD_EQ(nJmom);
+  MJ_MODEL_FIELD_EQ(nuserdata);
+  MJ_MODEL_FIELD_EQ(npluginstate);
+  MJ_MODEL_FIELD_EQ(narena);
+  MJ_MODEL_FIELD_EQ(nbuffer);
+#undef MJ_MODEL_FIELD_EQ
+
+  return true;
+}
+
+std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
+                                                        int nbatch) {
+  if (py::isinstance<MjModelWrapper>(model_obj)) {
+    const raw::MjModel* model = CastMjModelOrThrow(model_obj, "model");
+    return std::vector<const raw::MjModel*>(nbatch, model);
+  }
+
+  py::sequence model_seq;
+  try {
+    model_seq = model_obj.cast<py::sequence>();
+  } catch (const py::cast_error&) {
+    throw py::type_error("model must be an MjModel or a sequence of MjModel");
+  }
+
+  py::ssize_t nmodel = py::len(model_seq);
+  if (nmodel <= 0) {
+    throw py::value_error("model sequence must not be empty");
+  }
+  if (nmodel != 1 && nmodel != nbatch) {
+    std::ostringstream msg;
+    msg << "model sequence must have length 1 or nbatch=" << nbatch
+        << ", got " << nmodel;
+    throw py::value_error(msg.str());
+  }
+
+  std::vector<const raw::MjModel*> models;
+  models.reserve(nmodel == 1 ? nbatch : nmodel);
+  for (py::ssize_t i = 0; i < nmodel; ++i) {
+    models.push_back(CastMjModelOrThrow(model_seq[i], "model", i));
+  }
+
+  for (py::ssize_t i = 1; i < nmodel; ++i) {
+    if (!SameModelDataLayout(models[0], models[i])) {
+      std::ostringstream msg;
+      msg << "models are not compatible: model[0] and model[" << i << "]";
+      throw py::value_error(msg.str());
+    }
+  }
+
+  if (nmodel == 1) {
+    models.resize(nbatch, models[0]);
+  }
+  return models;
+}
+
 std::string SupportedFieldsString() {
   std::ostringstream msg;
   msg << "{";
@@ -653,7 +761,7 @@ mjtNum* required_array_ptr(const PyCArray& arr, const char* name,
 
 class BatchEnvPool {
  public:
-  BatchEnvPool(py::object base_model_obj, int nbatch, int nthread)
+  BatchEnvPool(py::object model_obj, int nbatch, int nthread)
       : nbatch_(nbatch), nthread_(nthread) {
     if (nbatch_ <= 0) {
       throw py::value_error("nbatch must be positive");
@@ -662,12 +770,12 @@ class BatchEnvPool {
       throw py::value_error("nthread must be >= 0");
     }
 
-    const raw::MjModel* base =
-        base_model_obj.cast<const MjModelWrapper*>()->get();
+    std::vector<const raw::MjModel*> src_models =
+        NormalizeModelsOrThrow(model_obj, nbatch_);
 
     models_.resize(nbatch_, nullptr);
     for (int i = 0; i < nbatch_; ++i) {
-      models_[i] = mj_copyModel(nullptr, base);
+      models_[i] = InterceptMjErrors(mj_copyModel)(nullptr, src_models[i]);
       if (models_[i] == nullptr) {
         // cleanup previously allocated models before throwing
         for (int j = 0; j < i; ++j) {

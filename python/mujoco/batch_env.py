@@ -2,8 +2,9 @@
 
 This module wraps the pybind-backed ``_batch_env`` C++ module. The pool
 owns:
-  * ``nbatch`` ``mjModel`` instances (cloned from a caller-supplied base
-    model via ``mj_copyModel``),
+  * ``nbatch`` ``mjModel`` instances (cloned from one caller-supplied
+    model, or from a caller-supplied compatible model sequence, via
+    ``mj_copyModel``),
   * per-thread ``mjData`` workers,
   * an internal thread pool.
 
@@ -26,7 +27,7 @@ Supported randomization fields are listed in ``SUPPORTED_FIELDS``.
 from __future__ import annotations
 
 import numbers
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, Union
 
 import numpy as np
 import mujoco
@@ -88,13 +89,23 @@ class BatchEnvPool:
 
   def __init__(
       self,
-      model: mujoco.MjModel,
+      model: Union[mujoco.MjModel, Sequence[mujoco.MjModel]],
       *,
       nbatch: int,
       nthread: Optional[int] = None,
   ):
+    """Construct a batch pool from one model or a compatible model sequence.
+
+    Args:
+      model: A single ``MjModel`` to clone across the pool, or a compatible
+        sequence of ``MjModel`` instances with length ``1`` or ``nbatch``.
+      nbatch: Number of environments in the pool.
+      nthread: Number of worker threads. ``None`` means ``0``.
+    """
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
+    if not isinstance(model, mujoco.MjModel):
+      model = list(model)
     self._nthread = 0 if nthread is None else int(nthread)
     self._pool = _native.BatchEnvPool(
         model=model, nbatch=int(nbatch), nthread=self._nthread
