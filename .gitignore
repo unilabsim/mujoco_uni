@@ -13,6 +13,7 @@
 # Exclude editor config
 .vscode/
 .vs/
+.release-uv/
 
 # Exclude temporary folders
 *.egg-info/
