@@ -16,6 +16,10 @@ CONTAINER_RUNTIME=""
 CONTAINER_ARCH="auto"
 CONTROL_PYTHON_VERSION="${MUJOCO_RELEASE_CONTROL_PYTHON:-3.10}"
 UV_RELEASE_DIR="${ROOT_DIR}/.release-uv"
+RELEASE_CACHE_ROOT="${UV_RELEASE_DIR}/cache"
+DEFAULT_UV_CACHE_DIR="${RELEASE_CACHE_ROOT}/uv"
+DEFAULT_PIP_CACHE_DIR="${RELEASE_CACHE_ROOT}/pip"
+DEFAULT_UV_PYTHON_INSTALL_DIR="${UV_RELEASE_DIR}/python"
 CONTROL_PYTHON=""
 TMP_WORK_ROOT=""
 USER_MUJOCO_CMAKE_ARGS="${MUJOCO_CMAKE_ARGS:-}"
@@ -158,23 +162,74 @@ is_python_path() {
   esac
 }
 
+configure_release_cache_dirs() {
+  export UV_CACHE_DIR="${UV_CACHE_DIR:-${DEFAULT_UV_CACHE_DIR}}"
+  export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${DEFAULT_PIP_CACHE_DIR}}"
+  export UV_PYTHON_INSTALL_DIR="${UV_PYTHON_INSTALL_DIR:-${DEFAULT_UV_PYTHON_INSTALL_DIR}}"
+
+  mkdir -p "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR"
+
+  echo "[env] uv cache dir: ${UV_CACHE_DIR}"
+  echo "[env] pip cache dir: ${PIP_CACHE_DIR}"
+  echo "[env] uv python dir: ${UV_PYTHON_INSTALL_DIR}"
+}
+
+resolve_python_spec() {
+  local python_spec="$1"
+  local resolved=""
+
+  if is_python_path "$python_spec"; then
+    printf '%s\n' "$python_spec"
+    return 0
+  fi
+
+  if resolved="$(env -u UV_PYTHON_INSTALL_DIR UV_CACHE_DIR="$UV_CACHE_DIR" uv python find --no-python-downloads "$python_spec" 2>/dev/null)"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  if resolved="$(UV_CACHE_DIR="$UV_CACHE_DIR" UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" uv python find --no-python-downloads "$python_spec" 2>/dev/null)"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  echo "[env] downloading Python ${python_spec} into ${UV_PYTHON_INSTALL_DIR}"
+  uv python install --install-dir "$UV_PYTHON_INSTALL_DIR" "$python_spec"
+  UV_CACHE_DIR="$UV_CACHE_DIR" UV_PYTHON_INSTALL_DIR="$UV_PYTHON_INSTALL_DIR" \
+    uv python find --no-python-downloads "$python_spec"
+}
+
 setup_uv_env() {
   local python_spec="$1"
   local env_dir="$2"
   shift 2
+  local requested_label
+  local existing_label=""
+  local recreate_env=0
 
-  if ! is_python_path "$python_spec"; then
-    uv python install "$python_spec"
+  requested_label="$(python_label_for_spec "$python_spec")"
+  if [[ -x "${env_dir}/bin/python" ]]; then
+    existing_label="$("${env_dir}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+    if [[ "$existing_label" != "$requested_label" ]]; then
+      recreate_env=1
+    fi
+  else
+    recreate_env=1
   fi
 
-  rm -rf "$env_dir"
-  mkdir -p "$(dirname "$env_dir")"
-  uv venv --python "$python_spec" "$env_dir"
+  if [[ "$recreate_env" -eq 1 ]]; then
+    rm -rf "$env_dir"
+    mkdir -p "$(dirname "$env_dir")"
+    uv venv --python "$python_spec" "$env_dir"
+  else
+    uv venv --allow-existing --python "$python_spec" "$env_dir"
+  fi
   uv pip install --python "${env_dir}/bin/python" --upgrade "$@"
 }
 
 setup_release_tools() {
   local include_mujoco="$1"
+  local control_python_spec
   local packages=(build setuptools twine wheel absl-py)
 
   if [[ "$(uname -s)" == "Linux" ]]; then
@@ -185,7 +240,8 @@ setup_release_tools() {
   fi
 
   echo "[env] preparing uv release env: Python ${CONTROL_PYTHON_VERSION}"
-  setup_uv_env "$CONTROL_PYTHON_VERSION" "${UV_RELEASE_DIR}/control" "${packages[@]}"
+  control_python_spec="$(resolve_python_spec "$CONTROL_PYTHON_VERSION")"
+  setup_uv_env "$control_python_spec" "${UV_RELEASE_DIR}/control" "${packages[@]}"
   CONTROL_PYTHON="${UV_RELEASE_DIR}/control/bin/python"
 }
 
@@ -518,7 +574,7 @@ build_wheel_for_python_spec() {
   copy_release_workspace "$worker_repo_root"
   rm -rf "${worker_python_root}/dist" "${worker_python_root}/build" "${worker_python_root}"/*.egg-info
 
-  worker_cmake_args="${USER_MUJOCO_CMAKE_ARGS:-}$(linux_libcxx_python_cmake_args) -DCMAKE_MODULE_PATH:PATH=${worker_repo_root}/cmake;${worker_python_root}/mujoco/cmake"
+  worker_cmake_args="${USER_MUJOCO_CMAKE_ARGS:-}$(linux_libcxx_python_cmake_args) -DCMAKE_MODULE_PATH:PATH=${MUJOCO_REPO_ROOT}/cmake;${ROOT_DIR}/mujoco/cmake"
 
   (
     cd "$worker_python_root"
@@ -549,8 +605,13 @@ build_host_wheels_parallel() {
   local failed=0
   local -a pids=()
   local -a labels=()
+  local -a resolved_specs=()
 
   mkdir -p "$wheels_dir" "$logs_dir" "$ROOT_DIR/dist"
+  for python_spec in "${python_specs[@]}"; do
+    resolved_specs+=("$(resolve_python_spec "$python_spec")")
+  done
+  python_specs=("${resolved_specs[@]}")
   cmake_parallel_level="$(recommended_cmake_parallel_level "${#python_specs[@]}")"
   echo "[info] building Python wheels in parallel: ${python_specs[*]}"
   if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
@@ -641,6 +702,7 @@ run_smoke_testpypi() {
 }
 
 cd "$ROOT_DIR"
+configure_release_cache_dirs
 require_uv
 TMP_WORK_ROOT="$(mktemp -d)"
 trap cleanup_release_workspace EXIT
