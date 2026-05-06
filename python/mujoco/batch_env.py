@@ -257,6 +257,70 @@ class BatchEnvPool:
         chunk_size=chunk_size,
     )
 
+  # -- batched site Jacobians ----------------------------------------
+  def compute_site_jacobians(
+      self,
+      initial_state,
+      site_ids,
+      *,
+      jacp: bool = True,
+      jacr: bool = False,
+      initial_warmstart=None,
+      chunk_size: Optional[int] = None,
+  ):
+    """Compute site Jacobians over the full env pool in parallel.
+
+    Per env this runs ``mj_kinematics + mj_comPos`` on the worker's mjData
+    (the minimum prefix required by ``mj_jacSite``), then emits jacp / jacr
+    for every requested site.
+
+    Args:
+      initial_state: ``(nbatch, nstate)`` full-physics states.
+      site_ids: scalar int or 1-D int sequence ``(K,)``. Same site set is
+        used for every env.
+      jacp: emit translation Jacobians ``(nbatch, K, 3, nv)``.
+      jacr: emit rotation Jacobians    ``(nbatch, K, 3, nv)``.
+      initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
+      chunk_size: thread-pool chunk size, optional.
+
+    Returns:
+      A tuple ``(jacp, jacr)``. The unrequested entry is ``None``. When
+      ``site_ids`` is a Python scalar the K dimension is squeezed, returning
+      ``(nbatch, 3, nv)`` outputs.
+    """
+    if self._pool is None:
+      raise RuntimeError("compute_site_jacobians requested after pool close")
+    if not jacp and not jacr:
+      raise ValueError("at least one of jacp / jacr must be True")
+
+    initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
+    if initial_state.ndim != 2 or initial_state.shape[0] != self.nbatch:
+      raise ValueError(
+          f"initial_state must have shape (nbatch={self.nbatch}, nstate), "
+          f"got {initial_state.shape}"
+      )
+    if initial_warmstart is not None:
+      initial_warmstart = np.ascontiguousarray(
+          initial_warmstart, dtype=np.float64
+      )
+
+    site_ids_arr, scalar_index = _normalize_indices(site_ids)
+
+    jacp_arr, jacr_arr = self._pool.compute_site_jacobians(
+        state0=initial_state,
+        site_ids=site_ids_arr,
+        jacp=bool(jacp),
+        jacr=bool(jacr),
+        warmstart0=initial_warmstart,
+        chunk_size=chunk_size,
+    )
+    if scalar_index:
+      if jacp_arr is not None:
+        jacp_arr = jacp_arr[:, 0]
+      if jacr_arr is not None:
+        jacr_arr = jacr_arr[:, 0]
+    return jacp_arr, jacr_arr
+
   # -- sparse reset ---------------------------------------------------
   def reset(
       self,

@@ -60,6 +60,25 @@ TEST_XML_FREE = r"""
 </mujoco>
 """
 
+TEST_XML_TWO_SITES = r"""
+<mujoco>
+  <worldbody>
+    <geom type="plane" size="5 5 .1"/>
+    <body pos="0 0 .1">
+      <joint name="yaw" axis="0 0 1"/>
+      <joint name="pitch" axis="0 1 0"/>
+      <geom type="capsule" size=".02" fromto="0 0 0 1 0 0"/>
+      <site name="tip" pos="1 0 0"/>
+      <body pos=".5 0 0">
+        <joint name="elbow" axis="0 1 0"/>
+        <geom type="capsule" size=".02" fromto="0 0 0 .4 0 0"/>
+        <site name="hand" pos=".4 0 0"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
 TEST_XML_POSITION = r"""
 <mujoco>
   <worldbody>
@@ -846,6 +865,130 @@ class IndexedFieldTest(parameterized.TestCase):
       ref_state, _ = _reference_forward(ref_model, init[0])
 
     np.testing.assert_allclose(state[0], ref_state, atol=1e-10, rtol=1e-10)
+
+
+def _reference_site_jacobian(model, state0_row, site_id, jacp, jacr):
+  data = mujoco.MjData(model)
+  mujoco.mj_setState(
+      model, data, state0_row, int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+  )
+  mujoco.mj_kinematics(model, data)
+  mujoco.mj_comPos(model, data)
+  jp = np.zeros((3, model.nv), dtype=np.float64) if jacp else None
+  jr = np.zeros((3, model.nv), dtype=np.float64) if jacr else None
+  mujoco.mj_jacSite(model, data, jp, jr, site_id)
+  return jp, jr
+
+
+class JacobianTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.rng = np.random.default_rng(11)
+
+  @parameterized.parameters((0, True, False), (0, False, True), (0, True, True),
+                            (4, True, True))
+  def test_matches_reference_single_model(self, nthread, jacp, jacr):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_TWO_SITES)
+    nbatch = 6
+    state0 = _rand_state(model, nbatch, self.rng)
+    tip_id = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_SITE), "tip"
+    )
+    hand_id = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_SITE), "hand"
+    )
+    site_ids = [tip_id, hand_id]
+
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, nthread=nthread
+    ) as pool:
+      jp, jr = pool.compute_site_jacobians(
+          state0, site_ids, jacp=jacp, jacr=jacr
+      )
+
+    if jacp:
+      self.assertEqual(jp.shape, (nbatch, len(site_ids), 3, model.nv))
+    else:
+      self.assertIsNone(jp)
+    if jacr:
+      self.assertEqual(jr.shape, (nbatch, len(site_ids), 3, model.nv))
+    else:
+      self.assertIsNone(jr)
+
+    for i in range(nbatch):
+      for k, site in enumerate(site_ids):
+        ref_jp, ref_jr = _reference_site_jacobian(
+            model, state0[i], site, jacp, jacr
+        )
+        if jacp:
+          np.testing.assert_allclose(jp[i, k], ref_jp, atol=1e-12, rtol=0)
+        if jacr:
+          np.testing.assert_allclose(jr[i, k], ref_jr, atol=1e-12, rtol=0)
+
+  def test_scalar_site_squeezes_K_dim(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    nbatch = 4
+    state0 = _rand_state(model, nbatch, self.rng)
+    site_id = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_SITE), "site"
+    )
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool:
+      jp, jr = pool.compute_site_jacobians(
+          state0, site_id, jacp=True, jacr=True
+      )
+
+    self.assertEqual(jp.shape, (nbatch, 3, model.nv))
+    self.assertEqual(jr.shape, (nbatch, 3, model.nv))
+    for i in range(nbatch):
+      ref_jp, ref_jr = _reference_site_jacobian(
+          model, state0[i], site_id, True, True
+      )
+      np.testing.assert_allclose(jp[i], ref_jp, atol=1e-12, rtol=0)
+      np.testing.assert_allclose(jr[i], ref_jr, atol=1e-12, rtol=0)
+
+  def test_matches_reference_multi_model(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_TWO_SITES)
+    model1 = copy.copy(model0)
+    model1.body_mass[:] *= 1.7
+    model1.body_ipos[1] += np.array([0.01, -0.02, 0.03], dtype=np.float64)
+    ref_data = mujoco.MjData(model1)
+    mujoco.mj_setConst(model1, ref_data)
+
+    state0 = _rand_state(model0, 2, self.rng)
+    tip_id = mujoco.mj_name2id(
+        model0, int(mujoco.mjtObj.mjOBJ_SITE), "tip"
+    )
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=2) as pool:
+      jp, _ = pool.compute_site_jacobians(state0, [tip_id], jacp=True)
+
+    ref_jp0, _ = _reference_site_jacobian(model0, state0[0], tip_id, True, False)
+    ref_jp1, _ = _reference_site_jacobian(model1, state0[1], tip_id, True, False)
+    np.testing.assert_allclose(jp[0, 0], ref_jp0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(jp[1, 0], ref_jp1, atol=1e-12, rtol=0)
+
+  def test_requires_at_least_one_flag(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    state0 = _rand_state(model, 2, self.rng)
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=0) as pool:
+      with self.assertRaises(ValueError):
+        pool.compute_site_jacobians(state0, [0], jacp=False, jacr=False)
+
+  def test_invalid_site_id(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    state0 = _rand_state(model, 2, self.rng)
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=0) as pool:
+      with self.assertRaises(ValueError):
+        pool.compute_site_jacobians(state0, [model.nsite], jacp=True)
+
+  def test_wrong_state_shape(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    bad = _rand_state(model, 3, self.rng)
+    with batch_env.BatchEnvPool(model, nbatch=4, nthread=0) as pool:
+      with self.assertRaises(ValueError):
+        pool.compute_site_jacobians(bad, [0], jacp=True)
 
 
 if __name__ == "__main__":

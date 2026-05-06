@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import gc
 import time
@@ -53,6 +54,47 @@ BENCH_XML = r"""
         <body pos=".3 0 0">
           <joint axis="0 1 0"/>
           <geom type="capsule" size=".02" fromto="0 0 0 .3 0 0"/>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
+# A 7-DOF serial arm with end-effector and elbow sites — a more
+# representative target for site-Jacobian benchmarks (manipulation /
+# end-effector control).
+BENCH_XML_JAC = r"""
+<mujoco>
+  <worldbody>
+    <geom type="plane" size="5 5 .1"/>
+    <body pos="0 0 .1">
+      <joint name="j0" axis="0 0 1"/>
+      <geom type="capsule" size=".03" fromto="0 0 0 0 0 .3"/>
+      <body pos="0 0 .3">
+        <joint name="j1" axis="0 1 0"/>
+        <geom type="capsule" size=".03" fromto="0 0 0 .3 0 0"/>
+        <site name="elbow" pos=".3 0 0"/>
+        <body pos=".3 0 0">
+          <joint name="j2" axis="1 0 0"/>
+          <geom type="capsule" size=".03" fromto="0 0 0 .3 0 0"/>
+          <body pos=".3 0 0">
+            <joint name="j3" axis="0 1 0"/>
+            <geom type="capsule" size=".03" fromto="0 0 0 .25 0 0"/>
+            <body pos=".25 0 0">
+              <joint name="j4" axis="1 0 0"/>
+              <geom type="capsule" size=".025" fromto="0 0 0 .15 0 0"/>
+              <body pos=".15 0 0">
+                <joint name="j5" axis="0 1 0"/>
+                <geom type="capsule" size=".02" fromto="0 0 0 .1 0 0"/>
+                <body pos=".1 0 0">
+                  <joint name="j6" axis="1 0 0"/>
+                  <geom type="box" size=".04 .02 .02"/>
+                  <site name="ee" pos=".04 0 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
         </body>
       </body>
     </body>
@@ -219,6 +261,154 @@ def bench_patch_refresh(model, nbatch, nthread, warmup, repeat, rng):
       print(f"  {label:38s}: {t*1e6:8.1f} us/call")
 
 
+def _python_loop_site_jacobians(model, state0, site_ids, jacp, jacr):
+  """Single-threaded Python reference: serial mj_jacSite over all envs."""
+  data = mujoco.MjData(model)
+  nbatch = state0.shape[0]
+  K = len(site_ids)
+  jp = np.empty((nbatch, K, 3, model.nv), dtype=np.float64) if jacp else None
+  jr = np.empty((nbatch, K, 3, model.nv), dtype=np.float64) if jacr else None
+  for r in range(nbatch):
+    mujoco.mj_setState(
+        model, data, state0[r], int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    )
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_comPos(model, data)
+    for k, site in enumerate(site_ids):
+      mujoco.mj_jacSite(
+          model, data,
+          jp[r, k] if jacp else None,
+          jr[r, k] if jacr else None,
+          int(site),
+      )
+  return jp, jr
+
+
+def _python_threaded_site_jacobians(
+    model, datas, state0, site_ids, jacp, jacr, executor
+):
+  """Python ThreadPoolExecutor reference. Each worker has its own mjData.
+
+  Tests how much the GIL-released pybind helps Python-side parallelism.
+  """
+  nbatch = state0.shape[0]
+  K = len(site_ids)
+  jp = np.empty((nbatch, K, 3, model.nv), dtype=np.float64) if jacp else None
+  jr = np.empty((nbatch, K, 3, model.nv), dtype=np.float64) if jacr else None
+  nthread = len(datas)
+  chunk = max(1, nbatch // (10 * nthread))
+
+  def worker(thread_id, start, end):
+    data = datas[thread_id]
+    for r in range(start, end):
+      mujoco.mj_setState(
+          model, data, state0[r], int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+      )
+      mujoco.mj_kinematics(model, data)
+      mujoco.mj_comPos(model, data)
+      for k, site in enumerate(site_ids):
+        mujoco.mj_jacSite(
+            model, data,
+            jp[r, k] if jacp else None,
+            jr[r, k] if jacr else None,
+            int(site),
+        )
+
+  # Naive round-robin assignment of chunks to thread ids.
+  futures = []
+  job = 0
+  start = 0
+  while start < nbatch:
+    end = min(start + chunk, nbatch)
+    tid = job % nthread
+    futures.append(executor.submit(worker, tid, start, end))
+    start = end
+    job += 1
+  for f in futures:
+    f.result()
+  return jp, jr
+
+
+def bench_jacobian(model, nbatch, K, nthread, warmup, repeat, rng, label):
+  nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+  state0 = rng.standard_normal((nbatch, nstate)).astype(np.float64)
+
+  if model.nsite < 1:
+    print(f"[jacobian:{label}] model has no sites — skipping")
+    return
+  K = min(K, model.nsite)
+  site_ids = list(range(K))
+
+  print(
+      f"[jacobian:{label}] nbatch={nbatch} K={K} nthread={nthread} "
+      f"nv={model.nv} nbody={model.nbody}"
+  )
+
+  # ---- baseline 1: pure-Python serial loop -----------------------------
+  def py_serial():
+    _python_loop_site_jacobians(model, state0, site_ids, True, False)
+  t_py_serial = _time_it(py_serial, warmup, repeat)
+
+  # ---- baseline 2: Python ThreadPoolExecutor ---------------------------
+  if nthread > 0:
+    py_datas = [mujoco.MjData(model) for _ in range(nthread)]
+    py_executor = concurrent.futures.ThreadPoolExecutor(max_workers=nthread)
+    try:
+      def py_threaded():
+        _python_threaded_site_jacobians(
+            model, py_datas, state0, site_ids, True, False, py_executor
+        )
+      t_py_threaded = _time_it(py_threaded, warmup, repeat)
+    finally:
+      py_executor.shutdown(wait=True)
+  else:
+    t_py_threaded = float("nan")
+
+  # ---- candidate: pool single-thread -----------------------------------
+  with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool_st:
+    def pool_single():
+      pool_st.compute_site_jacobians(state0, site_ids, jacp=True, jacr=False)
+    t_pool_st = _time_it(pool_single, warmup, repeat)
+
+  # ---- candidate: pool multi-thread ------------------------------------
+  if nthread > 0:
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, nthread=nthread
+    ) as pool_mt:
+      def pool_multi():
+        pool_mt.compute_site_jacobians(state0, site_ids, jacp=True, jacr=False)
+      t_pool_mt = _time_it(pool_multi, warmup, repeat)
+  else:
+    t_pool_mt = float("nan")
+
+  # ---- numerical sanity (optional, cheap) ------------------------------
+  jp_ref, _ = _python_loop_site_jacobians(model, state0, site_ids, True, False)
+  with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool_check:
+    jp_pool, _ = pool_check.compute_site_jacobians(
+        state0, site_ids, jacp=True, jacr=False
+    )
+  max_abs_err = float(np.max(np.abs(jp_ref - jp_pool)))
+
+  rows = [
+      ("python serial         ", t_py_serial),
+      (f"python threadpool x{nthread} ", t_py_threaded),
+      ("pool single-thread    ", t_pool_st),
+      (f"pool multi-thread x{nthread}  ", t_pool_mt),
+  ]
+  base = t_py_serial
+  for name, t in rows:
+    if not np.isfinite(t):
+      print(f"  {name}: n/a")
+      continue
+    speedup = base / t if t > 0 else float("nan")
+    per_call_us = t * 1e6 / max(nbatch * K, 1)
+    print(
+        f"  {name}: {t*1e3:8.2f} ms  "
+        f"({per_call_us:7.2f} us/(env*site))  speedup={speedup:5.1f}x"
+    )
+  print(f"  parity vs python-serial: max abs err = {max_abs_err:.2e}")
+
+
 def bench_memory(model, nbatch):
   # Per-model memory via mj_sizeModel.
   bytes_per_model = mujoco.mj_sizeModel(model)
@@ -242,9 +432,14 @@ def main():
   rng = np.random.default_rng(args.seed)
   model = mujoco.MjModel.from_xml_string(BENCH_XML)
   model_sequence = _make_model_sequence(model, args.nbatch)
+  jac_model = mujoco.MjModel.from_xml_string(BENCH_XML_JAC)
   print(
       f"model: nbody={model.nbody} nv={model.nv} "
       f"ngeom={model.ngeom} nsensordata={model.nsensordata}"
+  )
+  print(
+      f"jac_model: nbody={jac_model.nbody} nv={jac_model.nv} "
+      f"nsite={jac_model.nsite}"
   )
 
   bench_memory(model, args.nbatch)
@@ -294,6 +489,21 @@ def main():
       rng,
       "multi-model",
   )
+  gc.collect()
+
+  # ---- Jacobian scan: small / medium / large -------------------------
+  for label, jac_nbatch, K in (
+      ("small",  64,         min(2, jac_model.nsite)),
+      ("medium", 1024,       min(2, jac_model.nsite)),
+      ("large",  args.nbatch, min(2, jac_model.nsite)),
+  ):
+    if jac_nbatch <= 0:
+      continue
+    bench_jacobian(
+        jac_model, jac_nbatch, K, args.nthread,
+        args.warmup, args.repeat, rng, label,
+    )
+    gc.collect()
 
 
 if __name__ == "__main__":

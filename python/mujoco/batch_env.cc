@@ -732,6 +732,103 @@ void _unsafe_full_forward_threaded(const std::vector<raw::MjModel*>& models,
   pool->WaitCount(njobs);
 }
 
+// Site-Jacobian kernel. Per env: setState, run kinematics + comPos prefix
+// (the minimum that mj_jacSite reads from), then emit jacp/jacr for every
+// requested site into the contiguous (nbatch, nsite_query, 3, nv) outputs.
+// Output pointers may be null when the corresponding flavor is not requested.
+void _unsafe_jacobians_range(const std::vector<raw::MjModel*>& models,
+                             raw::MjData* d, int start, int end,
+                             const mjtNum* state0, const mjtNum* warmstart0,
+                             const int* site_ids, int nsite_query,
+                             mjtNum* jacp_out, mjtNum* jacr_out) {
+  const raw::MjModel* m0 = models[0];
+  size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
+  size_t nv = static_cast<size_t>(m0->nv);
+  int nbody = m0->nbody;
+  int neq = m0->neq;
+  size_t per_env_block =
+      static_cast<size_t>(nsite_query) * 3 * nv;
+
+  for (int r = start; r < end; ++r) {
+    raw::MjModel* me = models[r];
+
+    mju_zero(d->ctrl, me->nu);
+    mju_zero(d->qfrc_applied, nv);
+    mju_zero(d->xfrc_applied, 6 * nbody);
+
+    for (int i = 0; i < nbody; i++) {
+      int id = me->body_mocapid[i];
+      if (id >= 0) {
+        mju_copy3(d->mocap_pos + 3 * id, me->body_pos + 3 * i);
+        mju_copy4(d->mocap_quat + 4 * id, me->body_quat + 4 * i);
+      }
+    }
+    for (int i = 0; i < neq; i++) {
+      d->eq_active[i] = me->eq_active0[i];
+    }
+
+    mj_setState(me, d, state0 + static_cast<size_t>(r) * nstate,
+                mjSTATE_FULLPHYSICS);
+    if (warmstart0) {
+      mju_copy(d->qacc_warmstart,
+               warmstart0 + static_cast<size_t>(r) * nv, nv);
+    } else {
+      mju_zero(d->qacc_warmstart, nv);
+    }
+    for (int i = 0; i < mjNWARNING; i++) {
+      d->warning[i].number = 0;
+    }
+
+    // Position-stage prefix that mj_jacSite reads:
+    //   site_xpos        ← mj_kinematics
+    //   subtree_com,cdof ← mj_comPos
+    mj_kinematics(me, d);
+    mj_comPos(me, d);
+
+    size_t env_off = static_cast<size_t>(r) * per_env_block;
+    for (int s = 0; s < nsite_query; ++s) {
+      size_t out_off = env_off + static_cast<size_t>(s) * 3 * nv;
+      mjtNum* jp = jacp_out ? jacp_out + out_off : nullptr;
+      mjtNum* jr = jacr_out ? jacr_out + out_off : nullptr;
+      mj_jacSite(me, d, jp, jr, site_ids[s]);
+    }
+  }
+}
+
+void _unsafe_jacobians_threaded(const std::vector<raw::MjModel*>& models,
+                                std::vector<raw::MjData*>& d, int nbatch,
+                                const mjtNum* state0, const mjtNum* warmstart0,
+                                const int* site_ids, int nsite_query,
+                                mjtNum* jacp_out, mjtNum* jacr_out,
+                                ThreadPool* pool, int chunk_size) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
+  int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
+
+  pool->ResetCount();
+
+  for (int j = 0; j < nfulljobs; j++) {
+    auto task = [=, &models, &d](void) {
+      int id = pool->WorkerId();
+      _unsafe_jacobians_range(models, d[id], j * chunk_size,
+                              (j + 1) * chunk_size, state0, warmstart0,
+                              site_ids, nsite_query, jacp_out, jacr_out);
+    };
+    pool->Schedule(task);
+  }
+  if (chunk_remainder > 0) {
+    auto task = [=, &models, &d](void) {
+      _unsafe_jacobians_range(
+          models, d[pool->WorkerId()], nfulljobs * chunk_size,
+          nfulljobs * chunk_size + chunk_remainder, state0, warmstart0,
+          site_ids, nsite_query, jacp_out, jacr_out);
+    };
+    pool->Schedule(task);
+  }
+
+  pool->WaitCount(njobs);
+}
+
 mjtNum* optional_array_ptr(const std::optional<PyCArray>& arg, const char* name,
                            size_t expected) {
   if (!arg.has_value()) return nullptr;
@@ -927,6 +1024,100 @@ class BatchEnvPool {
     }
 
     return sensordata_out;
+  }
+
+  // -----------------------------------------------------------------
+  // Site-Jacobian batch.
+  //
+  //   state0:    (nbatch, nstate)
+  //   site_ids:  (K,) int32, in [0, nsite); same site set used for every env
+  //   jacp/jacr: at least one must be true
+  //
+  // Returns (jacp_or_none, jacr_or_none); each is (nbatch, K, 3, nv).
+  //
+  // Internally re-runs mj_kinematics + mj_comPos per env on the worker's
+  // mjData, then calls mj_jacSite for each site. No constraint or actuator
+  // stages are evaluated.
+  // -----------------------------------------------------------------
+  py::tuple compute_site_jacobians(
+      const PyCArray state0, const PyIArray site_ids, bool jacp, bool jacr,
+      std::optional<const PyCArray> warmstart0,
+      std::optional<int> chunk_size) {
+    if (!jacp && !jacr) {
+      throw py::value_error(
+          "compute_site_jacobians: at least one of jacp / jacr must be True");
+    }
+    if (state0.ndim() != 2 || state0.shape(0) != nbatch_) {
+      std::ostringstream msg;
+      msg << "state0 must have shape (nbatch=" << nbatch_
+          << ", nstate=" << nstate_ << "), got (";
+      for (int i = 0; i < state0.ndim(); ++i) {
+        msg << state0.shape(i) << (i + 1 < state0.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+
+    if (site_ids.ndim() != 1) {
+      throw py::value_error("site_ids must be a 1-D array");
+    }
+    int nsite_query = static_cast<int>(site_ids.shape(0));
+    if (nsite_query <= 0) {
+      throw py::value_error("site_ids must be non-empty");
+    }
+    int nsite_model = models_[0]->nsite;
+    const int* site_ids_ptr = site_ids.data();
+    for (int s = 0; s < nsite_query; ++s) {
+      int id = site_ids_ptr[s];
+      if (id < 0 || id >= nsite_model) {
+        std::ostringstream msg;
+        msg << "site_ids[" << s << "]=" << id << " is out of range [0, "
+            << nsite_model << ")";
+        throw py::value_error(msg.str());
+      }
+    }
+
+    size_t sz_state0 = static_cast<size_t>(nbatch_) * nstate_;
+    size_t sz_warmstart = static_cast<size_t>(nbatch_) * nv_;
+    std::optional<PyCArray> state0_opt = state0;
+    mjtNum* state0_ptr = optional_array_ptr(state0_opt, "state0", sz_state0);
+    mjtNum* warmstart0_ptr =
+        optional_array_ptr(warmstart0, "warmstart0", sz_warmstart);
+
+    std::vector<py::ssize_t> shape = {nbatch_, nsite_query, 3, nv_};
+    py::object none = py::none();
+    py::object jacp_obj = none;
+    py::object jacr_obj = none;
+    mjtNum* jacp_ptr = nullptr;
+    mjtNum* jacr_ptr = nullptr;
+    if (jacp) {
+      PyCArray arr(shape);
+      jacp_ptr = static_cast<mjtNum*>(arr.request().ptr);
+      jacp_obj = std::move(arr);
+    }
+    if (jacr) {
+      PyCArray arr(shape);
+      jacr_ptr = static_cast<mjtNum*>(arr.request().ptr);
+      jacr_obj = std::move(arr);
+    }
+
+    {
+      py::gil_scoped_release no_gil;
+      if (nthread_ > 0 && nbatch_ > 1) {
+        int chunk = chunk_size.has_value()
+                        ? *chunk_size
+                        : std::max(1, nbatch_ / (10 * nthread_));
+        InterceptMjErrors(_unsafe_jacobians_threaded)(
+            models_, worker_data_, nbatch_, state0_ptr, warmstart0_ptr,
+            site_ids_ptr, nsite_query, jacp_ptr, jacr_ptr, pool_.get(), chunk);
+      } else {
+        InterceptMjErrors(_unsafe_jacobians_range)(
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, warmstart0_ptr,
+            site_ids_ptr, nsite_query, jacp_ptr, jacr_ptr);
+      }
+    }
+
+    return py::make_tuple(jacp_obj, jacr_obj);
   }
 
   // -----------------------------------------------------------------
@@ -1197,6 +1388,11 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("randomization") = py::none(),
            py::arg("initial_warmstart") = py::none(),
            py::arg("skipsensor") = false, py::arg("chunk_size") = py::none())
+      .def("compute_site_jacobians", &BatchEnvPool::compute_site_jacobians,
+           py::kw_only(), py::arg("state0"), py::arg("site_ids"),
+           py::arg("jacp") = true, py::arg("jacr") = false,
+           py::arg("warmstart0") = py::none(),
+           py::arg("chunk_size") = py::none())
       .def("get_model", &BatchEnvPool::get_model, py::arg("env_id"))
       .def("get_models", &BatchEnvPool::get_models, py::arg("env_ids"))
       .def("get_all_models", &BatchEnvPool::get_all_models)
