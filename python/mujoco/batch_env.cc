@@ -24,6 +24,7 @@
 // caller-supplied env_ids array.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -421,6 +422,113 @@ void ValidateFieldIndexOrThrow(int index, int index_count,
         << "' with size " << index_count;
     throw py::value_error(msg.str());
   }
+}
+
+enum class HfieldAlignment {
+  kYaw,
+  kWorld,
+  kBody,
+};
+
+enum class HfieldSampleOutput {
+  kHeight,
+  kClearance,
+};
+
+HfieldAlignment ParseHfieldAlignmentOrThrow(const std::string& alignment) {
+  if (alignment == "yaw") return HfieldAlignment::kYaw;
+  if (alignment == "world" || alignment == "none") {
+    return HfieldAlignment::kWorld;
+  }
+  if (alignment == "body" || alignment == "full") {
+    return HfieldAlignment::kBody;
+  }
+  std::ostringstream msg;
+  msg << "alignment must be one of {'yaw', 'world', 'none', 'body', 'full'}, "
+      << "got '" << alignment << "'";
+  throw py::value_error(msg.str());
+}
+
+HfieldSampleOutput ParseHfieldOutputOrThrow(const std::string& output) {
+  if (output == "height" || output == "terrain_height") {
+    return HfieldSampleOutput::kHeight;
+  }
+  if (output == "clearance") {
+    return HfieldSampleOutput::kClearance;
+  }
+  std::ostringstream msg;
+  msg << "output must be one of {'height', 'terrain_height', 'clearance'}, "
+      << "got '" << output << "'";
+  throw py::value_error(msg.str());
+}
+
+void ValidateHfieldSamplerIdsOrThrow(
+    const std::vector<raw::MjModel*>& models, int hfield_geom_id,
+    int frame_body_id) {
+  for (size_t i = 0; i < models.size(); ++i) {
+    const raw::MjModel* m = models[i];
+    if (hfield_geom_id < 0 || hfield_geom_id >= m->ngeom) {
+      std::ostringstream msg;
+      msg << "hfield_geom_id=" << hfield_geom_id
+          << " is out of range for model[" << i << "] with ngeom="
+          << m->ngeom;
+      throw py::value_error(msg.str());
+    }
+    if (m->geom_type[hfield_geom_id] != mjGEOM_HFIELD) {
+      std::ostringstream msg;
+      msg << "geom " << hfield_geom_id << " in model[" << i
+          << "] is not an hfield geom";
+      throw py::value_error(msg.str());
+    }
+    int hfield_id = m->geom_dataid[hfield_geom_id];
+    if (hfield_id < 0 || hfield_id >= m->nhfield) {
+      std::ostringstream msg;
+      msg << "geom " << hfield_geom_id << " in model[" << i
+          << "] does not reference a valid hfield";
+      throw py::value_error(msg.str());
+    }
+    if (m->hfield_nrow[hfield_id] < 2 || m->hfield_ncol[hfield_id] < 2) {
+      std::ostringstream msg;
+      msg << "hfield " << hfield_id << " in model[" << i
+          << "] must be at least 2x2";
+      throw py::value_error(msg.str());
+    }
+    if (frame_body_id < 0 || frame_body_id >= m->nbody) {
+      std::ostringstream msg;
+      msg << "frame_body_id=" << frame_body_id
+          << " is out of range for model[" << i << "] with nbody="
+          << m->nbody;
+      throw py::value_error(msg.str());
+    }
+  }
+}
+
+mjtNum SampleHfieldLocalHeight(const raw::MjModel* m, int hfield_id,
+                               mjtNum local_x, mjtNum local_y) {
+  int nrow = m->hfield_nrow[hfield_id];
+  int ncol = m->hfield_ncol[hfield_id];
+  const mjtNum* size = m->hfield_size + 4 * hfield_id;
+  const float* data = m->hfield_data + m->hfield_adr[hfield_id];
+
+  mjtNum sx = (local_x + size[0]) / (2 * size[0]) * (ncol - 1);
+  mjtNum sy = (local_y + size[1]) / (2 * size[1]) * (nrow - 1);
+  sx = std::min<mjtNum>(std::max<mjtNum>(sx, 0), ncol - 1);
+  sy = std::min<mjtNum>(std::max<mjtNum>(sy, 0), nrow - 1);
+
+  int c0 = static_cast<int>(std::floor(sx));
+  int r0 = static_cast<int>(std::floor(sy));
+  int c1 = std::min(c0 + 1, ncol - 1);
+  int r1 = std::min(r0 + 1, nrow - 1);
+  mjtNum wx = sx - c0;
+  mjtNum wy = sy - r0;
+
+  mjtNum h00 = data[r0 * ncol + c0];
+  mjtNum h10 = data[r0 * ncol + c1];
+  mjtNum h01 = data[r1 * ncol + c0];
+  mjtNum h11 = data[r1 * ncol + c1];
+  mjtNum h0 = h00 * (1 - wx) + h10 * wx;
+  mjtNum h1 = h01 * (1 - wx) + h11 * wx;
+  return (h0 * (1 - wy) + h1 * wy) * size[2];
 }
 
 // ===================================================================
@@ -861,6 +969,135 @@ void _unsafe_jacobians_threaded(const std::vector<raw::MjModel*>& models,
   pool->WaitCount(njobs);
 }
 
+// Hfield bilinear sampling kernel. Per env: set full-physics state, run the
+// kinematic prefix needed for body and geom world poses, transform the local
+// offset pattern through the requested frame alignment, then sample the target
+// hfield in geom-local coordinates. Boundary samples are clamped to the hfield
+// extent.
+void _unsafe_hfield_sample_range(
+    const std::vector<raw::MjModel*>& models, raw::MjData* d, int start,
+    int end, const mjtNum* state0, int hfield_geom_id,
+    const mjtNum* offsets, int npoint, int frame_body_id,
+    HfieldAlignment alignment, HfieldSampleOutput output, mjtNum* sample_out) {
+  const raw::MjModel* m0 = models[0];
+  size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
+  size_t nv = static_cast<size_t>(m0->nv);
+  int nbody = m0->nbody;
+  int neq = m0->neq;
+
+  for (int r = start; r < end; ++r) {
+    raw::MjModel* me = models[r];
+
+    mju_zero(d->ctrl, me->nu);
+    mju_zero(d->qfrc_applied, nv);
+    mju_zero(d->xfrc_applied, 6 * nbody);
+
+    for (int i = 0; i < nbody; i++) {
+      int id = me->body_mocapid[i];
+      if (id >= 0) {
+        mju_copy3(d->mocap_pos + 3 * id, me->body_pos + 3 * i);
+        mju_copy4(d->mocap_quat + 4 * id, me->body_quat + 4 * i);
+      }
+    }
+    for (int i = 0; i < neq; i++) {
+      d->eq_active[i] = me->eq_active0[i];
+    }
+
+    mj_setState(me, d, state0 + static_cast<size_t>(r) * nstate,
+                mjSTATE_FULLPHYSICS);
+    mju_zero(d->qacc_warmstart, nv);
+    for (int i = 0; i < mjNWARNING; i++) {
+      d->warning[i].number = 0;
+    }
+
+    mj_kinematics(me, d);
+
+    int hfield_id = me->geom_dataid[hfield_geom_id];
+    const mjtNum* frame_pos = d->xpos + 3 * frame_body_id;
+    const mjtNum* frame_mat = d->xmat + 9 * frame_body_id;
+    const mjtNum* geom_pos = d->geom_xpos + 3 * hfield_geom_id;
+    const mjtNum* geom_mat = d->geom_xmat + 9 * hfield_geom_id;
+
+    mjtNum cos_yaw = 1;
+    mjtNum sin_yaw = 0;
+    if (alignment == HfieldAlignment::kYaw) {
+      mjtNum yaw = std::atan2(frame_mat[3], frame_mat[0]);
+      cos_yaw = std::cos(yaw);
+      sin_yaw = std::sin(yaw);
+    }
+
+    mjtNum* out = sample_out + static_cast<size_t>(r) * npoint;
+    for (int p = 0; p < npoint; ++p) {
+      mjtNum ox = offsets[2 * p];
+      mjtNum oy = offsets[2 * p + 1];
+      mjtNum world_x;
+      mjtNum world_y;
+      switch (alignment) {
+        case HfieldAlignment::kYaw:
+          world_x = frame_pos[0] + cos_yaw * ox - sin_yaw * oy;
+          world_y = frame_pos[1] + sin_yaw * ox + cos_yaw * oy;
+          break;
+        case HfieldAlignment::kBody:
+          world_x = frame_pos[0] + frame_mat[0] * ox + frame_mat[1] * oy;
+          world_y = frame_pos[1] + frame_mat[3] * ox + frame_mat[4] * oy;
+          break;
+        case HfieldAlignment::kWorld:
+          world_x = frame_pos[0] + ox;
+          world_y = frame_pos[1] + oy;
+          break;
+      }
+
+      mjtNum rel_x = world_x - geom_pos[0];
+      mjtNum rel_y = world_y - geom_pos[1];
+      mjtNum local_x = geom_mat[0] * rel_x + geom_mat[3] * rel_y;
+      mjtNum local_y = geom_mat[1] * rel_x + geom_mat[4] * rel_y;
+      mjtNum local_height =
+          SampleHfieldLocalHeight(me, hfield_id, local_x, local_y);
+      mjtNum terrain_z = geom_pos[2] + geom_mat[6] * local_x +
+                         geom_mat[7] * local_y +
+                         geom_mat[8] * local_height;
+      out[p] = output == HfieldSampleOutput::kClearance
+                   ? frame_pos[2] - terrain_z
+                   : terrain_z;
+    }
+  }
+}
+
+void _unsafe_hfield_sample_threaded(
+    const std::vector<raw::MjModel*>& models, std::vector<raw::MjData*>& d,
+    int nbatch, const mjtNum* state0, int hfield_geom_id,
+    const mjtNum* offsets, int npoint, int frame_body_id,
+    HfieldAlignment alignment, HfieldSampleOutput output, mjtNum* sample_out,
+    ThreadPool* pool, int chunk_size) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
+  int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
+
+  pool->ResetCount();
+
+  for (int j = 0; j < nfulljobs; j++) {
+    auto task = [=, &models, &d](void) {
+      int id = pool->WorkerId();
+      _unsafe_hfield_sample_range(
+          models, d[id], j * chunk_size, (j + 1) * chunk_size, state0,
+          hfield_geom_id, offsets, npoint, frame_body_id, alignment, output,
+          sample_out);
+    };
+    pool->Schedule(task);
+  }
+  if (chunk_remainder > 0) {
+    auto task = [=, &models, &d](void) {
+      _unsafe_hfield_sample_range(
+          models, d[pool->WorkerId()], nfulljobs * chunk_size,
+          nfulljobs * chunk_size + chunk_remainder, state0, hfield_geom_id,
+          offsets, npoint, frame_body_id, alignment, output, sample_out);
+    };
+    pool->Schedule(task);
+  }
+
+  pool->WaitCount(njobs);
+}
+
 mjtNum* optional_array_ptr(const std::optional<PyCArray>& arg, const char* name,
                            size_t expected) {
   if (!arg.has_value()) return nullptr;
@@ -1169,6 +1406,93 @@ class BatchEnvPool {
   }
 
   // -----------------------------------------------------------------
+  // MuJoCo hfield bilinear sampler.
+  //
+  //   state0:          (nbatch, nstate)
+  //   hfield_geom_id:  target geom; must be type=hfield in every model
+  //   offsets:         (K, 2) local XY pattern attached to frame_body_id
+  //   frame_body_id:   body providing attachment pose and clearance z
+  //   alignment:
+  //     "yaw"          rotate offsets by frame yaw only
+  //     "world"/"none" keep offsets in world XY axes
+  //     "body"/"full"  rotate offsets by the frame body's full XY columns
+  //   output:
+  //     "height"       sampled terrain world z
+  //     "clearance"    frame body world z minus sampled terrain world z
+  //
+  // Returns (nbatch, K). Metadata stays in the pool-owned mjModel; the hot
+  // path only sets state, runs kinematics, and samples hfield_data.
+  // -----------------------------------------------------------------
+  PyCArray sample_hfield_height(
+      const PyCArray state0, int hfield_geom_id, const PyCArray offsets,
+      int frame_body_id, const std::string& alignment,
+      const std::string& output, std::optional<int> chunk_size) {
+    if (state0.ndim() != 2 || state0.shape(0) != nbatch_ ||
+        state0.shape(1) != nstate_) {
+      std::ostringstream msg;
+      msg << "state0 must have shape (nbatch=" << nbatch_
+          << ", nstate=" << nstate_ << "), got (";
+      for (int i = 0; i < state0.ndim(); ++i) {
+        msg << state0.shape(i) << (i + 1 < state0.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+    if (offsets.ndim() != 2 || offsets.shape(1) != 2) {
+      std::ostringstream msg;
+      msg << "offsets must have shape (npoint, 2), got (";
+      for (int i = 0; i < offsets.ndim(); ++i) {
+        msg << offsets.shape(i) << (i + 1 < offsets.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+    int npoint = static_cast<int>(offsets.shape(0));
+    if (npoint <= 0) {
+      throw py::value_error("offsets must be non-empty");
+    }
+    if (chunk_size.has_value() && *chunk_size <= 0) {
+      throw py::value_error("chunk_size must be positive");
+    }
+
+    HfieldAlignment alignment_enum =
+        ParseHfieldAlignmentOrThrow(alignment);
+    HfieldSampleOutput output_enum = ParseHfieldOutputOrThrow(output);
+    ValidateHfieldSamplerIdsOrThrow(
+        models_, hfield_geom_id, frame_body_id);
+
+    size_t sz_state0 = static_cast<size_t>(nbatch_) * nstate_;
+    size_t sz_offsets = static_cast<size_t>(npoint) * 2;
+    std::optional<PyCArray> state0_opt = state0;
+    mjtNum* state0_ptr = optional_array_ptr(state0_opt, "state0", sz_state0);
+    mjtNum* offsets_ptr =
+        required_array_ptr(offsets, "offsets", sz_offsets);
+
+    PyCArray sample_out({nbatch_, npoint});
+    mjtNum* sample_ptr = static_cast<mjtNum*>(sample_out.request().ptr);
+
+    {
+      py::gil_scoped_release no_gil;
+      if (nthread_ > 0 && nbatch_ > 1) {
+        int chunk = chunk_size.has_value()
+                        ? *chunk_size
+                        : std::max(1, nbatch_ / (10 * nthread_));
+        InterceptMjErrors(_unsafe_hfield_sample_threaded)(
+            models_, worker_data_, nbatch_, state0_ptr, hfield_geom_id,
+            offsets_ptr, npoint, frame_body_id, alignment_enum, output_enum,
+            sample_ptr, pool_.get(), chunk);
+      } else {
+        InterceptMjErrors(_unsafe_hfield_sample_range)(
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, hfield_geom_id,
+            offsets_ptr, npoint, frame_body_id, alignment_enum, output_enum,
+            sample_ptr);
+      }
+    }
+
+    return sample_out;
+  }
+
+  // -----------------------------------------------------------------
   // Sparse reset with optional per-env model patching.
   //
   // randomization: dict[str, ndarray] where each ndarray has leading dim
@@ -1442,6 +1766,11 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::kw_only(), py::arg("state0"), py::arg("site_ids"),
            py::arg("jacp") = true, py::arg("jacr") = false,
            py::arg("warmstart0") = py::none(),
+           py::arg("chunk_size") = py::none())
+      .def("sample_hfield_height", &BatchEnvPool::sample_hfield_height,
+           py::kw_only(), py::arg("state0"), py::arg("hfield_geom_id"),
+           py::arg("offsets"), py::arg("frame_body_id"),
+           py::arg("alignment") = "yaw", py::arg("output") = "height",
            py::arg("chunk_size") = py::none())
       .def("get_model", &BatchEnvPool::get_model, py::arg("env_id"))
       .def("get_models", &BatchEnvPool::get_models, py::arg("env_ids"))

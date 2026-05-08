@@ -94,6 +94,24 @@ TEST_XML_POSITION = r"""
 </mujoco>
 """
 
+TEST_XML_HFIELD = r"""
+<mujoco>
+  <asset>
+    <hfield name="terrain" nrow="2" ncol="2" size="1 1 1 .1"
+            elevation="0 1
+                       0 1"/>
+  </asset>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="terrain" type="hfield" hfield="terrain" pos="0 0 0"/>
+    <body name="base" pos="0 0 1">
+      <freejoint/>
+      <geom name="base_geom" type="sphere" size=".05"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
 
 def _rand_state(model, nbatch, rng):
   nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
@@ -121,6 +139,37 @@ def _reference_last_state(model, state0, control):
   data = [mujoco.MjData(model)]
   state_traj, _ = stateless_rollout.rollout([model], data, state0, control)
   return state_traj[:, -1, :]
+
+
+def _hfield_model(height_data):
+  model = mujoco.MjModel.from_xml_string(TEST_XML_HFIELD)
+  np.asarray(model.hfield_data)[:] = np.asarray(
+      height_data, dtype=np.float32
+  ).reshape(-1)
+  return model
+
+
+def _state_from_free_qpos(model, qpos_rows):
+  qpos_rows = np.asarray(qpos_rows, dtype=np.float64)
+  if qpos_rows.ndim == 1:
+    qpos_rows = qpos_rows[None, :]
+  nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+  state = np.zeros((qpos_rows.shape[0], nstate), dtype=np.float64)
+  for i, qpos in enumerate(qpos_rows):
+    data = mujoco.MjData(model)
+    data.qpos[:] = qpos
+    mujoco.mj_forward(model, data)
+    mujoco.mj_getState(
+        model, data, state[i], int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    )
+  return state
+
+
+def _free_qpos(x=0.0, y=0.0, z=1.5, yaw=0.0):
+  return np.array(
+      [x, y, z, np.cos(0.5 * yaw), 0.0, 0.0, np.sin(0.5 * yaw)],
+      dtype=np.float64,
+  )
 
 
 FIELD_COMPONENT_WIDTHS = {
@@ -523,6 +572,127 @@ class ForwardTest(parameterized.TestCase):
     _, ref_sensor1 = _reference_forward(model1, state0[1])
     np.testing.assert_allclose(sensor[0], ref_sensor0, atol=1e-12, rtol=0)
     np.testing.assert_allclose(sensor[1], ref_sensor1, atol=1e-12, rtol=0)
+
+
+class HfieldSamplerTest(parameterized.TestCase):
+
+  @parameterized.parameters((0,), (2,))
+  def test_height_clearance_and_clamp(self, nthread):
+    model = _hfield_model([[0.0, 0.2], [0.4, 1.0]])
+    hfield_geom_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "terrain"
+    )
+    frame_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "base"
+    )
+    state0 = np.repeat(
+        _state_from_free_qpos(model, _free_qpos(z=1.5)), 2, axis=0
+    )
+    offsets = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=nthread) as pool:
+      height = pool.sample_hfield_height(
+          state0, hfield_geom_id, offsets, frame_body_id, alignment="world"
+      )
+      clearance = pool.sample_hfield_height(
+          state0,
+          hfield_geom_id,
+          offsets,
+          frame_body_id,
+          alignment="world",
+          output="clearance",
+      )
+
+    expected_height = np.array([0.4, 1.0, 1.0], dtype=np.float64)
+    np.testing.assert_allclose(
+        height, np.repeat(expected_height[None, :], 2, axis=0), atol=1e-12
+    )
+    np.testing.assert_allclose(
+        clearance,
+        np.repeat((1.5 - expected_height)[None, :], 2, axis=0),
+        atol=1e-12,
+    )
+
+  def test_yaw_alignment_rotates_offsets(self):
+    model = _hfield_model([[0.0, 1.0], [0.0, 1.0]])
+    hfield_geom_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "terrain"
+    )
+    frame_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "base"
+    )
+    state0 = _state_from_free_qpos(model, _free_qpos(yaw=np.pi / 2))
+    offsets = np.array([[1.0, 0.0]])
+
+    with batch_env.BatchEnvPool(model, nbatch=1, nthread=0) as pool:
+      yaw_height = pool.sample_hfield_height(
+          state0, hfield_geom_id, offsets, frame_body_id, alignment="yaw"
+      )
+      world_height = pool.sample_hfield_height(
+          state0, hfield_geom_id, offsets, frame_body_id, alignment="world"
+      )
+
+    np.testing.assert_allclose(yaw_height, [[0.5]], atol=1e-12)
+    np.testing.assert_allclose(world_height, [[1.0]], atol=1e-12)
+
+  def test_model_variants_use_per_env_hfield_data(self):
+    model0 = _hfield_model([[0.0, 0.0], [0.0, 0.0]])
+    model1 = _hfield_model([[1.0, 1.0], [1.0, 1.0]])
+    hfield_geom_id = mujoco.mj_name2id(
+        model0, mujoco.mjtObj.mjOBJ_GEOM, "terrain"
+    )
+    frame_body_id = mujoco.mj_name2id(
+        model0, mujoco.mjtObj.mjOBJ_BODY, "base"
+    )
+    state0 = np.repeat(
+        _state_from_free_qpos(model0, _free_qpos()), 2, axis=0
+    )
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=2) as pool:
+      height = pool.sample_hfield_height(
+          state0, hfield_geom_id, [[0.0, 0.0]], frame_body_id
+      )
+
+    np.testing.assert_allclose(height, [[0.0], [1.0]], atol=1e-12)
+
+  def test_validation_errors(self):
+    model = _hfield_model([[0.0, 1.0], [0.0, 1.0]])
+    hfield_geom_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "terrain"
+    )
+    frame_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "base"
+    )
+    non_hfield_geom_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_GEOM, "base_geom"
+    )
+    state0 = _state_from_free_qpos(model, _free_qpos())
+
+    with batch_env.BatchEnvPool(model, nbatch=1, nthread=0) as pool:
+      with self.assertRaises(ValueError):
+        pool.sample_hfield_height(
+            state0, hfield_geom_id, np.zeros((2, 3)), frame_body_id
+        )
+      with self.assertRaises(ValueError):
+        pool.sample_hfield_height(
+            state0, non_hfield_geom_id, [[0.0, 0.0]], frame_body_id
+        )
+      with self.assertRaises(ValueError):
+        pool.sample_hfield_height(
+            state0,
+            hfield_geom_id,
+            [[0.0, 0.0]],
+            frame_body_id,
+            output="distance",
+        )
+      with self.assertRaises(ValueError):
+        pool.sample_hfield_height(
+            state0,
+            hfield_geom_id,
+            [[0.0, 0.0]],
+            frame_body_id,
+            chunk_size=0,
+        )
 
 
 class ResetTest(parameterized.TestCase):

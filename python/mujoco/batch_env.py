@@ -22,6 +22,9 @@ It exposes three execution primitives:
     envs with optional per-env model field patching and selective
     ``mj_setConst`` refresh.
 
+  * :meth:`BatchEnvPool.sample_hfield_height` — MuJoCo hfield-only
+    yaw/body/world aligned bilinear terrain sampling over the full env pool.
+
 Supported randomization fields are listed in ``SUPPORTED_FIELDS``.
 """
 
@@ -63,6 +66,14 @@ def _normalize_indices(indices) -> tuple[np.ndarray, bool]:
   if arr.dtype.kind not in ("i", "u"):
     raise TypeError("indices must contain integers")
   return np.ascontiguousarray(arr, dtype=np.int32), False
+
+
+def _normalize_scalar_int(name: str, value) -> int:
+  if isinstance(value, (bool, np.bool_)):
+    raise TypeError(f"{name} must be an integer id")
+  if not isinstance(value, numbers.Integral):
+    raise TypeError(f"{name} must be an integer id")
+  return int(value)
 
 
 def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
@@ -332,6 +343,74 @@ class BatchEnvPool:
       if jacr_arr is not None:
         jacr_arr = jacr_arr[:, 0]
     return jacp_arr, jacr_arr
+
+  # -- hfield height sampling ----------------------------------------
+  def sample_hfield_height(
+      self,
+      initial_state,
+      hfield_geom_id: int,
+      offsets,
+      frame_body_id: int,
+      *,
+      alignment: str = "yaw",
+      output: str = "height",
+      chunk_size: Optional[int] = None,
+  ) -> np.ndarray:
+    """Sample a MuJoCo hfield geom with bilinear interpolation.
+
+    This is a hfield-only sensor primitive. Per environment it sets
+    ``initial_state`` on the pool-owned model/data, runs the kinematic prefix
+    needed for body and geom poses, attaches ``offsets`` to ``frame_body_id``,
+    and samples the target hfield in geom-local coordinates. Samples outside
+    the hfield domain are clamped to the border.
+
+    Args:
+      initial_state: ``(nbatch, nstate)`` full-physics states.
+      hfield_geom_id: integer geom id; the geom must be type ``hfield`` in
+        every pool-owned model.
+      offsets: ``(npoint, 2)`` local XY sample pattern.
+      frame_body_id: body id used as the attachment frame.
+      alignment: ``"yaw"`` (default), ``"world"``/``"none"``, or
+        ``"body"``/``"full"``.
+      output: ``"height"``/``"terrain_height"`` for sampled world z, or
+        ``"clearance"`` for ``frame_z - sampled_world_z``.
+      chunk_size: thread-pool chunk size, optional.
+
+    Returns:
+      ``(nbatch, npoint)`` float64 array.
+    """
+    if self._pool is None:
+      raise RuntimeError("sample_hfield_height requested after pool close")
+
+    initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
+    if initial_state.shape != (self.nbatch, self.nstate):
+      raise ValueError(
+          f"initial_state must have shape (nbatch={self.nbatch}, "
+          f"nstate={self.nstate}), got {initial_state.shape}"
+      )
+
+    offsets = np.ascontiguousarray(offsets, dtype=np.float64)
+    if offsets.ndim != 2 or offsets.shape[1] != 2:
+      raise ValueError(f"offsets must have shape (npoint, 2), got {offsets.shape}")
+    if offsets.shape[0] == 0:
+      raise ValueError("offsets must be non-empty")
+
+    hfield_geom_id = _normalize_scalar_int("hfield_geom_id", hfield_geom_id)
+    frame_body_id = _normalize_scalar_int("frame_body_id", frame_body_id)
+    if chunk_size is not None and chunk_size <= 0:
+      raise ValueError("chunk_size must be positive")
+    alignment = str(alignment).lower()
+    output = str(output).lower()
+
+    return self._pool.sample_hfield_height(
+        state0=initial_state,
+        hfield_geom_id=hfield_geom_id,
+        offsets=offsets,
+        frame_body_id=frame_body_id,
+        alignment=alignment,
+        output=output,
+        chunk_size=chunk_size,
+    )
 
   # -- sparse reset ---------------------------------------------------
   def reset(
