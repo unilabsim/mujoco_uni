@@ -11,7 +11,8 @@ owns:
 It exposes three execution primitives:
 
   * :meth:`BatchEnvPool.step` — multi-step ``mj_step`` over the full
-    env pool. Returns only the **final** state and sensordata
+    env pool. Returns only the **final** state, and can optionally also
+    return the final-step sensordata
     (``(nbatch, nstate)`` / ``(nbatch, nsensordata)``), not trajectories.
 
   * :meth:`BatchEnvPool.forward` — single ``mj_forward`` over all envs.
@@ -170,22 +171,31 @@ class BatchEnvPool:
       control=None,
       initial_warmstart=None,
       chunk_size: Optional[int] = None,
+      return_sensor: bool = False,
+      post_step_forward_sensor: bool = False,
   ):
     """Run ``nstep`` of ``mj_step`` on every environment.
 
-    Returns only the **final** state after all steps. Sensor computation
-    is skipped — use :meth:`forward` afterwards if you need sensors.
+    Returns only the **final** state after all steps by default. When
+    ``return_sensor`` is true, returns ``(state, sensordata)`` where
+    ``sensordata`` is only the final step's sensor data, not a trajectory.
 
     Args:
       initial_state: ``(nbatch, nstate)`` full-physics initial states.
-      nstep: number of steps.randomization
+      nstep: number of steps.
       control_spec: MuJoCo ``mjtState`` flags for control.
       control: ``(nbatch, nstep, ncontrol)`` control trajectories, optional.
       initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
       chunk_size: thread-pool chunk size, optional.
+      return_sensor: return final-step sensordata together with state.
+      post_step_forward_sensor: if returning sensors, run one ``mj_forward`` on
+        the final state before copying sensordata. This matches the previous
+        ``step`` followed by ``forward`` refresh behavior. When false, the
+        sensordata left by the final ``mj_step`` is returned directly.
 
     Returns:
-      ``state`` array with shape ``(nbatch, nstate)``.
+      ``state`` array with shape ``(nbatch, nstate)``, or
+      ``(state, sensordata)`` when ``return_sensor`` is true.
     """
     if self._pool is None:
       raise RuntimeError("step requested after pool close")
@@ -212,6 +222,8 @@ class BatchEnvPool:
         warmstart0=initial_warmstart,
         control=control,
         chunk_size=chunk_size,
+        return_sensor=bool(return_sensor),
+        post_step_forward_sensor=bool(post_step_forward_sensor),
     )
 
   # -- forward --------------------------------------------------------

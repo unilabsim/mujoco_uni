@@ -388,6 +388,68 @@ class StepTest(parameterized.TestCase):
     self.assertEqual(state.shape, (nbatch, nstate))
     np.testing.assert_array_equal(state, ref_last_state)
 
+  @parameterized.parameters((0,), (4,))
+  def test_last_state_and_sensor_matches_rollout(self, nthread):
+    """step(return_sensor=True) returns only rollout's final state/sensor."""
+    nbatch, nstep = 8, 5
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    state0 = _rand_state(model, nbatch, self.rng)
+    control = self.rng.standard_normal(
+        (nbatch, nstep, model.nu)
+    ).astype(np.float64)
+
+    ref_models = [copy.copy(model) for _ in range(nbatch)]
+    ref_datas = (
+        [mujoco.MjData(model) for _ in range(nthread)]
+        if nthread > 0
+        else [mujoco.MjData(model)]
+    )
+    ref_state, ref_sensor = stateless_rollout.rollout(
+        ref_models, ref_datas, state0, control,
+    )
+
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, nthread=nthread
+    ) as pool:
+      state, sensor = pool.step(
+          state0,
+          nstep=nstep,
+          control_spec=int(mujoco.mjtState.mjSTATE_CTRL),
+          control=control,
+          return_sensor=True,
+      )
+      nstate = pool.nstate
+
+    self.assertEqual(state.shape, (nbatch, nstate))
+    self.assertEqual(sensor.shape, (nbatch, model.nsensordata))
+    np.testing.assert_array_equal(state, ref_state[:, -1, :])
+    np.testing.assert_allclose(sensor, ref_sensor[:, -1, :], atol=1e-12, rtol=0)
+
+  @parameterized.parameters((0,), (4,))
+  def test_post_step_forward_sensor_matches_forward_refresh(self, nthread):
+    """post_step_forward_sensor matches the previous step()+forward() path."""
+    nbatch, nstep = 8, 3
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    state0 = _rand_state(model, nbatch, self.rng)
+    control = self.rng.standard_normal(
+        (nbatch, nstep, model.nu)
+    ).astype(np.float64)
+
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, nthread=nthread
+    ) as pool:
+      state, sensor = pool.step(
+          state0,
+          nstep=nstep,
+          control_spec=int(mujoco.mjtState.mjSTATE_CTRL),
+          control=control,
+          return_sensor=True,
+          post_step_forward_sensor=True,
+      )
+      refreshed_sensor = pool.forward(state)
+
+    np.testing.assert_allclose(sensor, refreshed_sensor, atol=1e-12, rtol=0)
+
   def test_wrong_shape(self):
     model = mujoco.MjModel.from_xml_string(TEST_XML)
     with batch_env.BatchEnvPool(model, nbatch=4, nthread=0) as pool:

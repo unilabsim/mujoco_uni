@@ -428,17 +428,22 @@ void ValidateFieldIndexOrThrow(int index, int index_count,
 // the pool's owned models/data.
 // ===================================================================
 
-// Multi-step stepping over envs [start_roll, end_roll). Writes only the
-// FINAL state for each env to (nbatch, nstate) output. Sensor computation
-// is skipped entirely — callers that need sensors should use forward().
+// Multi-step stepping over envs [start_roll, end_roll). Writes the FINAL
+// state for each env to (nbatch, nstate) output. When sensordata_out is not
+// null, also writes the final-step sensordata for each env to
+// (nbatch, nsensordata). If post_step_forward_sensor is true, sensordata is
+// recomputed by running one mj_forward on the final state before copying,
+// matching the previous step()+forward() refresh path.
 void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
                   int start_roll, int end_roll, int nstep,
                   unsigned int control_spec, const mjtNum* state0,
                   const mjtNum* warmstart0, const mjtNum* control,
-                  mjtNum* state_out) {
+                  mjtNum* state_out, mjtNum* sensordata_out,
+                  bool post_step_forward_sensor) {
   size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
   size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
   size_t nv = static_cast<size_t>(m[0]->nv);
+  size_t nsensordata = static_cast<size_t>(m[0]->nsensordata);
   int nbody = m[0]->nbody, neq = m[0]->neq;
 
   if (!(control_spec & mjSTATE_CTRL)) {
@@ -502,6 +507,30 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
 
     // Write only the final state for this env.
     mj_getState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+    if (sensordata_out) {
+      if (post_step_forward_sensor) {
+        mju_zero(d->ctrl, m[r]->nu);
+        mju_zero(d->qfrc_applied, nv);
+        mju_zero(d->xfrc_applied, 6 * nbody);
+        for (int i = 0; i < nbody; i++) {
+          int id = m[r]->body_mocapid[i];
+          if (id >= 0) {
+            mju_copy3(d->mocap_pos + 3 * id, m[r]->body_pos + 3 * i);
+            mju_copy4(d->mocap_quat + 4 * id, m[r]->body_quat + 4 * i);
+          }
+        }
+        for (int i = 0; i < neq; i++) {
+          d->eq_active[i] = m[r]->eq_active0[i];
+        }
+        mj_setState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+        mju_zero(d->qacc_warmstart, nv);
+        for (int i = 0; i < mjNWARNING; i++) {
+          d->warning[i].number = 0;
+        }
+        mj_forwardSkip(m[r], d, mjSTAGE_NONE, 0);
+      }
+      mju_copy(sensordata_out + r * nsensordata, d->sensordata, nsensordata);
+    }
   }
 }
 
@@ -509,7 +538,8 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
                            std::vector<raw::MjData*>& d, int nbatch, int nstep,
                            unsigned int control_spec, const mjtNum* state0,
                            const mjtNum* warmstart0, const mjtNum* control,
-                           mjtNum* state_out, ThreadPool* pool,
+                           mjtNum* state_out, mjtNum* sensordata_out,
+                           bool post_step_forward_sensor, ThreadPool* pool,
                            int chunk_size) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
@@ -521,7 +551,8 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
     auto task = [=, &m, &d](void) {
       int id = pool->WorkerId();
       _unsafe_step(m, d[id], j * chunk_size, (j + 1) * chunk_size, nstep,
-                   control_spec, state0, warmstart0, control, state_out);
+                   control_spec, state0, warmstart0, control, state_out,
+                   sensordata_out, post_step_forward_sensor);
     };
     pool->Schedule(task);
   }
@@ -529,7 +560,8 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
     auto task = [=, &m, &d](void) {
       _unsafe_step(m, d[pool->WorkerId()], nfulljobs * chunk_size,
                    nfulljobs * chunk_size + chunk_remainder, nstep,
-                   control_spec, state0, warmstart0, control, state_out);
+                   control_spec, state0, warmstart0, control, state_out,
+                   sensordata_out, post_step_forward_sensor);
     };
     pool->Schedule(task);
   }
@@ -924,14 +956,18 @@ class BatchEnvPool {
   }
 
   // -----------------------------------------------------------------
-  // Multi-step stepping. Returns only the FINAL state for each env.
-  // Sensors are NOT computed — use forward() if you need them.
+  // Multi-step stepping. Returns the FINAL state for each env, and optionally
+  // the final-step sensordata. By default sensors are not copied, matching the
+  // historical state-only return.
   //   state output: (nbatch, nstate)
+  //   sensordata output: (nbatch, nsensordata), optional
   // -----------------------------------------------------------------
-  PyCArray step(int nstep, unsigned int control_spec, const PyCArray state0,
-                std::optional<const PyCArray> warmstart0,
-                std::optional<const PyCArray> control,
-                std::optional<int> chunk_size) {
+  py::object step(int nstep, unsigned int control_spec,
+                  const PyCArray state0,
+                  std::optional<const PyCArray> warmstart0,
+                  std::optional<const PyCArray> control,
+                  std::optional<int> chunk_size, bool return_sensor,
+                  bool post_step_forward_sensor) {
     if (nstep < 1) {
       throw py::value_error("nstep must be >= 1");
     }
@@ -957,6 +993,13 @@ class BatchEnvPool {
 
     PyCArray state_out({nbatch_, nstate_});
     mjtNum* state_ptr = static_cast<mjtNum*>(state_out.request().ptr);
+    std::optional<PyCArray> sensordata_out;
+    mjtNum* sensordata_ptr = nullptr;
+    if (return_sensor) {
+      sensordata_out.emplace(std::vector<py::ssize_t>{nbatch_, nsensordata_});
+      sensordata_ptr =
+          static_cast<mjtNum*>(sensordata_out->request().ptr);
+    }
 
     std::vector<const raw::MjModel*> cmodels(nbatch_);
     for (int i = 0; i < nbatch_; ++i) cmodels[i] = models_[i];
@@ -969,14 +1012,19 @@ class BatchEnvPool {
                         : std::max(1, nbatch_ / (10 * nthread_));
         InterceptMjErrors(_unsafe_step_threaded)(
             cmodels, worker_data_, nbatch_, nstep, control_spec, state0_ptr,
-            warmstart0_ptr, control_ptr, state_ptr, pool_.get(), chunk);
+            warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr,
+            post_step_forward_sensor, pool_.get(), chunk);
       } else {
         InterceptMjErrors(_unsafe_step)(
             cmodels, worker_data_[0], 0, nbatch_, nstep, control_spec,
-            state0_ptr, warmstart0_ptr, control_ptr, state_ptr);
+            state0_ptr, warmstart0_ptr, control_ptr, state_ptr,
+            sensordata_ptr, post_step_forward_sensor);
       }
     }
 
+    if (return_sensor) {
+      return py::make_tuple(state_out, *sensordata_out);
+    }
     return state_out;
   }
 
@@ -1379,7 +1427,9 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("control_spec"), py::arg("state0"),
            py::arg("warmstart0") = py::none(),
            py::arg("control") = py::none(),
-           py::arg("chunk_size") = py::none())
+           py::arg("chunk_size") = py::none(),
+           py::arg("return_sensor") = false,
+           py::arg("post_step_forward_sensor") = false)
       .def("forward", &BatchEnvPool::forward, py::kw_only(),
            py::arg("state0"), py::arg("warmstart0") = py::none(),
            py::arg("skipsensor") = false, py::arg("chunk_size") = py::none())
