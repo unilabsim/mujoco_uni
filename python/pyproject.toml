@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mujoco-uni"
-version = "3.8.0.rc2"
+version = "3.8.0"
 authors = [
     {name = "TATP-233"},
 ]
