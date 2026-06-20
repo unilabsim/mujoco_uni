@@ -102,6 +102,20 @@ BENCH_XML_JAC = r"""
 </mujoco>
 """
 
+BENCH_XML_RAY = r"""
+<mujoco>
+  <worldbody>
+    <geom type="plane" size="10 10 .1"/>
+    <geom type="box" pos="1.0 0.0 0.5" size=".1 .5 .5"/>
+    <geom type="box" pos="0.0 1.0 0.4" size=".5 .1 .4"/>
+    <body pos="0 0 .6">
+      <freejoint/>
+      <geom type="sphere" size=".05"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
 
 def _normalize_models(model_or_models, nbatch):
   if isinstance(model_or_models, mujoco.MjModel):
@@ -409,6 +423,109 @@ def bench_jacobian(model, nbatch, K, nthread, warmup, repeat, rng, label):
   print(f"  parity vs python-serial: max abs err = {max_abs_err:.2e}")
 
 
+def _python_loop_multi_ray(
+    model, state0, pnt, vec, *, bodyexclude=-1, return_normal=False
+):
+  data = mujoco.MjData(model)
+  nbatch = state0.shape[0]
+  nray = vec.shape[0]
+  dist = np.empty((nbatch, nray), dtype=np.float64)
+  geomid = np.empty((nbatch, nray), dtype=np.int32)
+  normal = (
+      np.empty((nbatch, nray, 3), dtype=np.float64) if return_normal else None
+  )
+  for r in range(nbatch):
+    mujoco.mj_setState(
+        model, data, state0[r], int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+    )
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_comPos(model, data)
+    mujoco.mj_multiRay(
+        m=model,
+        d=data,
+        pnt=pnt,
+        vec=vec.reshape(-1),
+        geomgroup=None,
+        flg_static=1,
+        bodyexclude=bodyexclude,
+        geomid=geomid[r],
+        dist=dist[r],
+        normal=None if normal is None else normal[r].reshape(-1),
+        nray=nray,
+        cutoff=mujoco.mjMAXVAL,
+    )
+  return dist, geomid, normal
+
+
+def bench_multi_ray(model, nbatch, nray, nthread, warmup, repeat, rng, label):
+  nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
+  state0 = np.zeros((nbatch, nstate), dtype=np.float64)
+  qpos = np.zeros((nbatch, model.nq), dtype=np.float64)
+  qpos[:, 0] = rng.uniform(-0.25, 0.25, size=nbatch)
+  qpos[:, 1] = rng.uniform(-0.25, 0.25, size=nbatch)
+  qpos[:, 2] = 0.6
+  qpos[:, 3] = 1.0
+  state0[:, :model.nq] = qpos
+
+  angles = np.linspace(0.0, 2.0 * np.pi, nray, endpoint=False, dtype=np.float64)
+  vec = np.empty((nray, 3), dtype=np.float64)
+  vec[:, 0] = np.cos(angles)
+  vec[:, 1] = np.sin(angles)
+  vec[:, 2] = -0.15
+  vec /= np.linalg.norm(vec, axis=1, keepdims=True)
+  pnt = np.array([0.0, 0.0, 0.6], dtype=np.float64)
+
+  print(
+      f"[multi_ray:{label}] nbatch={nbatch} nray={nray} "
+      f"nthread={nthread} ngeom={model.ngeom}"
+  )
+
+  def py_serial():
+    _python_loop_multi_ray(model, state0, pnt, vec)
+  t_py_serial = _time_it(py_serial, warmup, repeat)
+
+  with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool_st:
+    def pool_single():
+      pool_st.multi_ray(state0, pnt, vec)
+    t_pool_st = _time_it(pool_single, warmup, repeat)
+
+  if nthread > 0:
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=nthread) as pool_mt:
+      def pool_multi():
+        pool_mt.multi_ray(state0, pnt, vec)
+      t_pool_mt = _time_it(pool_multi, warmup, repeat)
+  else:
+    t_pool_mt = float("nan")
+
+  ref_dist, ref_geomid, _ = _python_loop_multi_ray(model, state0, pnt, vec)
+  with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool_check:
+    dist_pool, geomid_pool, _ = pool_check.multi_ray(state0, pnt, vec)
+  max_abs_err = float(np.max(np.abs(ref_dist - dist_pool)))
+  geomid_match = bool(np.array_equal(ref_geomid, geomid_pool))
+
+  rows = [
+      ("python serial         ", t_py_serial),
+      ("pool single-thread    ", t_pool_st),
+      (f"pool multi-thread x{nthread}  ", t_pool_mt),
+  ]
+  base = t_py_serial
+  total_rays = max(nbatch * nray, 1)
+  for name, t in rows:
+    if not np.isfinite(t):
+      print(f"  {name}: n/a")
+      continue
+    speedup = base / t if t > 0 else float("nan")
+    rays_per_sec = total_rays / t
+    print(
+        f"  {name}: {t*1e3:8.2f} ms  "
+        f"({rays_per_sec/1e6:7.2f} Mray/s)  speedup={speedup:5.1f}x"
+    )
+  print(
+      f"  parity vs python-serial: max abs err = {max_abs_err:.2e}, "
+      f"geomid exact = {geomid_match}"
+  )
+
+
 def bench_memory(model, nbatch):
   # Per-model memory via mj_sizeModel.
   bytes_per_model = mujoco.mj_sizeModel(model)
@@ -433,6 +550,7 @@ def main():
   model = mujoco.MjModel.from_xml_string(BENCH_XML)
   model_sequence = _make_model_sequence(model, args.nbatch)
   jac_model = mujoco.MjModel.from_xml_string(BENCH_XML_JAC)
+  ray_model = mujoco.MjModel.from_xml_string(BENCH_XML_RAY)
   print(
       f"model: nbody={model.nbody} nv={model.nv} "
       f"ngeom={model.ngeom} nsensordata={model.nsensordata}"
@@ -441,6 +559,7 @@ def main():
       f"jac_model: nbody={jac_model.nbody} nv={jac_model.nv} "
       f"nsite={jac_model.nsite}"
   )
+  print(f"ray_model: nbody={ray_model.nbody} nv={ray_model.nv} ngeom={ray_model.ngeom}")
 
   bench_memory(model, args.nbatch)
   gc.collect()
@@ -501,6 +620,20 @@ def main():
       continue
     bench_jacobian(
         jac_model, jac_nbatch, K, args.nthread,
+        args.warmup, args.repeat, rng, label,
+    )
+    gc.collect()
+
+  # ---- Multi-ray throughput scan ------------------------------------
+  for label, ray_nbatch, nray in (
+      ("small", 64, 32),
+      ("1024-env", 1024, 64),
+      ("large", args.nbatch, 64),
+  ):
+    if ray_nbatch <= 0:
+      continue
+    bench_multi_ray(
+        ray_model, ray_nbatch, nray, args.nthread,
         args.warmup, args.repeat, rng, label,
     )
     gc.collect()

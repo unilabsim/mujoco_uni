@@ -112,6 +112,19 @@ TEST_XML_HFIELD = r"""
 </mujoco>
 """
 
+TEST_XML_RAY = r"""
+<mujoco>
+  <worldbody>
+    <geom name="floor" type="plane" size="3 3 .1"/>
+    <geom name="wall" type="box" pos="1 0 0.5" size=".1 .5 .5"/>
+    <body name="caster" pos="0 0 .5">
+      <freejoint/>
+      <geom name="body_geom" type="sphere" size=".05"/>
+    </body>
+  </worldbody>
+</mujoco>
+"""
+
 
 def _rand_state(model, nbatch, rng):
   nstate = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_FULLPHYSICS)
@@ -139,6 +152,47 @@ def _reference_last_state(model, state0, control):
   data = [mujoco.MjData(model)]
   state_traj, _ = stateless_rollout.rollout([model], data, state0, control)
   return state_traj[:, -1, :]
+
+
+def _reference_multi_ray(
+    model,
+    state0_row,
+    pnt,
+    vec,
+    *,
+    geomgroup=None,
+    flg_static=1,
+    bodyexclude=-1,
+    return_normal=False,
+    cutoff=None,
+):
+  data = mujoco.MjData(model)
+  mujoco.mj_setState(
+      model, data, state0_row, int(mujoco.mjtState.mjSTATE_FULLPHYSICS)
+  )
+  mujoco.mj_kinematics(model, data)
+  mujoco.mj_comPos(model, data)
+
+  vec = np.asarray(vec, dtype=np.float64)
+  nray = vec.shape[0]
+  geomid = np.zeros(nray, dtype=np.int32)
+  dist = np.zeros(nray, dtype=np.float64)
+  normal = np.zeros((nray, 3), dtype=np.float64) if return_normal else None
+  mujoco.mj_multiRay(
+      m=model,
+      d=data,
+      pnt=np.asarray(pnt, dtype=np.float64),
+      vec=vec.reshape(-1),
+      geomgroup=geomgroup,
+      flg_static=flg_static,
+      bodyexclude=bodyexclude,
+      geomid=geomid,
+      dist=dist,
+      normal=None if normal is None else normal.reshape(-1),
+      nray=nray,
+      cutoff=mujoco.mjMAXVAL if cutoff is None else cutoff,
+  )
+  return dist, geomid, normal
 
 
 def _hfield_model(height_data):
@@ -693,6 +747,144 @@ class HfieldSamplerTest(parameterized.TestCase):
             frame_body_id,
             chunk_size=0,
         )
+
+
+class MultiRayTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self.rng = np.random.default_rng(123)
+
+  @parameterized.parameters((0,), (2,))
+  def test_matches_reference_shared_origin_and_rays(self, nthread):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_RAY)
+    state0 = _state_from_free_qpos(
+        model,
+        np.stack([
+            _free_qpos(x=0.0, y=0.0, z=0.5),
+            _free_qpos(x=0.2, y=0.0, z=0.5),
+            _free_qpos(x=-0.1, y=0.1, z=0.5),
+        ]),
+    )
+    pnt = np.array([0.0, 0.0, 0.6], dtype=np.float64)
+    vec = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        dtype=np.float64,
+    )
+
+    with batch_env.BatchEnvPool(model, nbatch=3, nthread=nthread) as pool:
+      dist, geomid, normal = pool.multi_ray(
+          state0, pnt, vec, return_normal=True
+      )
+
+    self.assertEqual(dist.shape, (3, 3))
+    self.assertEqual(geomid.shape, (3, 3))
+    self.assertEqual(normal.shape, (3, 3, 3))
+    for i in range(3):
+      ref_dist, ref_geomid, ref_normal = _reference_multi_ray(
+          model, state0[i], pnt, vec, return_normal=True
+      )
+      np.testing.assert_allclose(dist[i], ref_dist, atol=1e-12, rtol=0)
+      np.testing.assert_array_equal(geomid[i], ref_geomid)
+      np.testing.assert_allclose(normal[i], ref_normal, atol=1e-12, rtol=0)
+
+  def test_matches_reference_batched_origin_and_bodyexclude(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_RAY)
+    caster_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "caster"
+    )
+    state0 = _state_from_free_qpos(
+        model,
+        np.stack([
+            _free_qpos(x=0.0, y=0.0, z=0.5),
+            _free_qpos(x=0.3, y=0.0, z=0.5),
+        ]),
+    )
+    pnt = np.array([[0.0, 0.0, 0.55], [0.3, 0.0, 0.55]], dtype=np.float64)
+    vec = np.array([[0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    bodyexclude = np.array([caster_body_id, -1], dtype=np.int32)
+
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=0) as pool:
+      dist, geomid, normal = pool.multi_ray(
+          state0,
+          pnt,
+          vec,
+          bodyexclude=bodyexclude,
+          return_normal=False,
+      )
+
+    self.assertIsNone(normal)
+    for i in range(2):
+      ref_dist, ref_geomid, _ = _reference_multi_ray(
+          model,
+          state0[i],
+          pnt[i],
+          vec,
+          bodyexclude=int(bodyexclude[i]),
+          return_normal=False,
+      )
+      np.testing.assert_allclose(dist[i], ref_dist, atol=1e-12, rtol=0)
+      np.testing.assert_array_equal(geomid[i], ref_geomid)
+
+  def test_matches_reference_multi_model_batched_vec(self):
+    model0 = mujoco.MjModel.from_xml_string(TEST_XML_RAY)
+    model1 = copy.copy(model0)
+    model1.geom_pos[1] = np.array([1.4, 0.0, 0.5], dtype=np.float64)
+    ref_data = mujoco.MjData(model1)
+    mujoco.mj_setConst(model1, ref_data)
+
+    state0 = _state_from_free_qpos(
+        model0,
+        np.stack([
+            _free_qpos(x=0.0, y=0.0, z=0.5),
+            _free_qpos(x=0.0, y=0.0, z=0.5),
+        ]),
+    )
+    pnt = np.array([0.0, 0.0, 0.6], dtype=np.float64)
+    vec = np.array(
+        [
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+        ],
+        dtype=np.float64,
+    )
+
+    with batch_env.BatchEnvPool([model0, model1], nbatch=2, nthread=2) as pool:
+      dist, geomid, _ = pool.multi_ray(state0, pnt, vec)
+
+    ref_dist0, ref_geomid0, _ = _reference_multi_ray(
+        model0, state0[0], pnt, vec[0]
+    )
+    ref_dist1, ref_geomid1, _ = _reference_multi_ray(
+        model1, state0[1], pnt, vec[1]
+    )
+    np.testing.assert_allclose(dist[0], ref_dist0, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(dist[1], ref_dist1, atol=1e-12, rtol=0)
+    np.testing.assert_array_equal(geomid[0], ref_geomid0)
+    np.testing.assert_array_equal(geomid[1], ref_geomid1)
+
+  def test_validation_errors(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML_RAY)
+    state0 = _state_from_free_qpos(model, _free_qpos())
+    vec = np.array([[1.0, 0.0, 0.0]], dtype=np.float64)
+
+    with batch_env.BatchEnvPool(model, nbatch=1, nthread=0) as pool:
+      with self.assertRaises(ValueError):
+        pool.multi_ray(np.zeros((1, pool.nstate + 1)), [0, 0, 0], vec)
+      with self.assertRaises(ValueError):
+        pool.multi_ray(state0, np.zeros((1, 2)), vec)
+      with self.assertRaises(ValueError):
+        pool.multi_ray(state0, [0, 0, 0], np.zeros((1, 2)))
+      with self.assertRaises(ValueError):
+        pool.multi_ray(
+            state0, [0, 0, 0], vec, bodyexclude=np.array([0, 1], dtype=np.int32)
+        )
+      with self.assertRaises(ValueError):
+        pool.multi_ray(
+            state0, [0, 0, 0], vec, geomgroup=np.zeros((2,), dtype=np.uint8)
+        )
+      with self.assertRaises(TypeError):
+        pool.multi_ray(state0, [0, 0, 0], vec, bodyexclude=np.array([0.5]))
 
 
 class ResetTest(parameterized.TestCase):

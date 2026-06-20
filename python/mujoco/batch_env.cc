@@ -51,6 +51,7 @@ namespace {
 namespace py = ::pybind11;
 using PyCArray = py::array_t<mjtNum, py::array::c_style>;
 using PyIArray = py::array_t<int, py::array::c_style>;
+using PyBArray = py::array_t<mjtByte, py::array::c_style>;
 
 void KeepAlivePyObjectCapsuleDestructor(PyObject* pyobj) {
   py::gil_scoped_acquire gil;
@@ -974,6 +975,95 @@ void _unsafe_jacobians_threaded(const std::vector<raw::MjModel*>& models,
   pool->WaitCount(njobs);
 }
 
+// Batched multi-ray kernel. Per env: set full-physics state, run the
+// position-stage prefix needed by mj_multiRay (geom_xpos/xmat, xipos), then
+// cast nray rays from either a shared or per-env origin and direction bundle.
+void _unsafe_multi_ray_range(
+    const std::vector<raw::MjModel*>& models, raw::MjData* d, int start,
+    int end, const mjtNum* state0, const mjtNum* pnt, bool pnt_batched,
+    const mjtNum* vec, bool vec_batched, const mjtByte* geomgroup,
+    mjtByte flg_static, const int* bodyexclude, bool bodyexclude_batched,
+    int nray, mjtNum cutoff, int* geomid_out, mjtNum* dist_out,
+    mjtNum* normal_out) {
+  const raw::MjModel* m0 = models[0];
+  size_t nstate = static_cast<size_t>(mj_stateSize(m0, mjSTATE_FULLPHYSICS));
+  int nbody = m0->nbody;
+  size_t ray_block = static_cast<size_t>(nray);
+  size_t vec_block = 3 * ray_block;
+
+  for (int r = start; r < end; ++r) {
+    raw::MjModel* me = models[r];
+
+    for (int i = 0; i < nbody; i++) {
+      int id = me->body_mocapid[i];
+      if (id >= 0) {
+        mju_copy3(d->mocap_pos + 3 * id, me->body_pos + 3 * i);
+        mju_copy4(d->mocap_quat + 4 * id, me->body_quat + 4 * i);
+      }
+    }
+
+    mj_setState(me, d, state0 + static_cast<size_t>(r) * nstate,
+                mjSTATE_FULLPHYSICS);
+
+    // Minimum position-stage prefix that mj_multiRay reads:
+    //   geom_xpos/xmat ← mj_kinematics
+    //   xipos          ← mj_comPos
+    mj_kinematics(me, d);
+    mj_comPos(me, d);
+
+    const mjtNum* pnt_env =
+        pnt + (pnt_batched ? static_cast<size_t>(r) * 3 : 0);
+    const mjtNum* vec_env =
+        vec + (vec_batched ? static_cast<size_t>(r) * vec_block : 0);
+    int bodyexclude_env = bodyexclude[bodyexclude_batched ? r : 0];
+    int* geomid_env = geomid_out + static_cast<size_t>(r) * ray_block;
+    mjtNum* dist_env = dist_out + static_cast<size_t>(r) * ray_block;
+    mjtNum* normal_env =
+        normal_out ? normal_out + static_cast<size_t>(r) * vec_block : nullptr;
+
+    mj_multiRay(me, d, pnt_env, vec_env, geomgroup, flg_static,
+                bodyexclude_env, geomid_env, dist_env, normal_env, nray,
+                cutoff);
+  }
+}
+
+void _unsafe_multi_ray_threaded(
+    const std::vector<raw::MjModel*>& models, std::vector<raw::MjData*>& d,
+    int nbatch, const mjtNum* state0, const mjtNum* pnt, bool pnt_batched,
+    const mjtNum* vec, bool vec_batched, const mjtByte* geomgroup,
+    mjtByte flg_static, const int* bodyexclude, bool bodyexclude_batched,
+    int nray, mjtNum cutoff, int* geomid_out, mjtNum* dist_out,
+    mjtNum* normal_out, ThreadPool* pool, int chunk_size) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
+  int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
+
+  pool->ResetCount();
+
+  for (int j = 0; j < nfulljobs; j++) {
+    auto task = [=, &models, &d](void) {
+      int id = pool->WorkerId();
+      _unsafe_multi_ray_range(
+          models, d[id], j * chunk_size, (j + 1) * chunk_size, state0, pnt,
+          pnt_batched, vec, vec_batched, geomgroup, flg_static, bodyexclude,
+          bodyexclude_batched, nray, cutoff, geomid_out, dist_out, normal_out);
+    };
+    pool->Schedule(task);
+  }
+  if (chunk_remainder > 0) {
+    auto task = [=, &models, &d](void) {
+      _unsafe_multi_ray_range(
+          models, d[pool->WorkerId()], nfulljobs * chunk_size,
+          nfulljobs * chunk_size + chunk_remainder, state0, pnt, pnt_batched,
+          vec, vec_batched, geomgroup, flg_static, bodyexclude,
+          bodyexclude_batched, nray, cutoff, geomid_out, dist_out, normal_out);
+    };
+    pool->Schedule(task);
+  }
+
+  pool->WaitCount(njobs);
+}
+
 // Hfield bilinear sampling kernel. Per env: set full-physics state, run the
 // kinematic prefix needed for body and geom world poses, transform the local
 // offset pattern through the requested frame alignment, then sample the target
@@ -1484,6 +1574,162 @@ class BatchEnvPool {
   }
 
   // -----------------------------------------------------------------
+  // Batched mj_multiRay.
+  //
+  //   state0:       (nbatch, nstate)
+  //   pnt:          (3,) or (nbatch, 3)
+  //   vec:          (nray, 3) shared across envs, or (nbatch, nray, 3)
+  //   geomgroup:    optional (mjNGROUP,)
+  //   bodyexclude:  (1,) shared across envs, or (nbatch,)
+  //
+  // Returns (dist, geomid, normal_or_none) where:
+  //   dist:         (nbatch, nray)
+  //   geomid:       (nbatch, nray)
+  //   normal:       (nbatch, nray, 3), optional
+  //
+  // Internally this re-runs only mj_kinematics + mj_comPos per env before
+  // calling mj_multiRay, which is the minimum prefix needed by the ray code.
+  // -----------------------------------------------------------------
+  py::tuple multi_ray(const PyCArray state0, const PyCArray pnt,
+                      const PyCArray vec, std::optional<const PyBArray> geomgroup,
+                      mjtByte flg_static, const PyIArray bodyexclude,
+                      bool return_normal, mjtNum cutoff,
+                      std::optional<int> chunk_size) {
+    if (state0.ndim() != 2 || state0.shape(0) != nbatch_ ||
+        state0.shape(1) != nstate_) {
+      std::ostringstream msg;
+      msg << "state0 must have shape (nbatch=" << nbatch_
+          << ", nstate=" << nstate_ << "), got (";
+      for (int i = 0; i < state0.ndim(); ++i) {
+        msg << state0.shape(i) << (i + 1 < state0.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+    if (pnt.ndim() != 1 && pnt.ndim() != 2) {
+      throw py::value_error("pnt must have shape (3,) or (nbatch, 3)");
+    }
+    bool pnt_batched = pnt.ndim() == 2;
+    if ((!pnt_batched && pnt.shape(0) != 3) ||
+        (pnt_batched &&
+         (pnt.shape(0) != nbatch_ || pnt.shape(1) != 3))) {
+      std::ostringstream msg;
+      msg << "pnt must have shape (3,) or (nbatch=" << nbatch_ << ", 3), got (";
+      for (int i = 0; i < pnt.ndim(); ++i) {
+        msg << pnt.shape(i) << (i + 1 < pnt.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+
+    if (vec.ndim() != 2 && vec.ndim() != 3) {
+      throw py::value_error(
+          "vec must have shape (nray, 3) or (nbatch, nray, 3)");
+    }
+    bool vec_batched = vec.ndim() == 3;
+    int nray = 0;
+    if (!vec_batched) {
+      if (vec.shape(1) != 3) {
+        throw py::value_error("vec must have trailing shape (3,)");
+      }
+      nray = static_cast<int>(vec.shape(0));
+    } else {
+      if (vec.shape(0) != nbatch_ || vec.shape(2) != 3) {
+        std::ostringstream msg;
+        msg << "vec must have shape (nray, 3) or (nbatch=" << nbatch_
+            << ", nray, 3), got (";
+        for (int i = 0; i < vec.ndim(); ++i) {
+          msg << vec.shape(i) << (i + 1 < vec.ndim() ? ", " : "");
+        }
+        msg << ")";
+        throw py::value_error(msg.str());
+      }
+      nray = static_cast<int>(vec.shape(1));
+    }
+    if (nray <= 0) {
+      throw py::value_error("vec must contain at least one ray");
+    }
+    if (chunk_size.has_value() && *chunk_size <= 0) {
+      throw py::value_error("chunk_size must be positive");
+    }
+
+    if (bodyexclude.ndim() != 1 ||
+        (bodyexclude.shape(0) != 1 && bodyexclude.shape(0) != nbatch_)) {
+      std::ostringstream msg;
+      msg << "bodyexclude must have shape (1,) or (nbatch=" << nbatch_
+          << ",), got (";
+      for (int i = 0; i < bodyexclude.ndim(); ++i) {
+        msg << bodyexclude.shape(i)
+            << (i + 1 < bodyexclude.ndim() ? ", " : "");
+      }
+      msg << ")";
+      throw py::value_error(msg.str());
+    }
+    bool bodyexclude_batched = bodyexclude.shape(0) == nbatch_;
+
+    const mjtByte* geomgroup_ptr = nullptr;
+    if (geomgroup.has_value()) {
+      py::buffer_info info = geomgroup->request();
+      if (info.ndim != 1 || info.shape[0] != mjNGROUP) {
+        std::ostringstream msg;
+        msg << "geomgroup must have shape (" << mjNGROUP << ",), got (";
+        for (int i = 0; i < info.ndim; ++i) {
+          msg << info.shape[i] << (i + 1 < info.ndim ? ", " : "");
+        }
+        msg << ")";
+        throw py::value_error(msg.str());
+      }
+      geomgroup_ptr = static_cast<const mjtByte*>(info.ptr);
+    }
+
+    size_t sz_state0 = static_cast<size_t>(nbatch_) * nstate_;
+    size_t sz_pnt = pnt_batched ? static_cast<size_t>(nbatch_) * 3 : 3;
+    size_t sz_vec = vec_batched
+                        ? static_cast<size_t>(nbatch_) * nray * 3
+                        : static_cast<size_t>(nray) * 3;
+    std::optional<PyCArray> state0_opt = state0;
+    mjtNum* state0_ptr = optional_array_ptr(state0_opt, "state0", sz_state0);
+    mjtNum* pnt_ptr = required_array_ptr(pnt, "pnt", sz_pnt);
+    mjtNum* vec_ptr = required_array_ptr(vec, "vec", sz_vec);
+    const int* bodyexclude_ptr = bodyexclude.data();
+
+    PyCArray dist_out({nbatch_, nray});
+    PyIArray geomid_out({nbatch_, nray});
+    mjtNum* dist_ptr = static_cast<mjtNum*>(dist_out.request().ptr);
+    int* geomid_ptr = static_cast<int*>(geomid_out.request().ptr);
+
+    py::object normal_obj = py::none();
+    mjtNum* normal_ptr = nullptr;
+    if (return_normal) {
+      PyCArray arr({nbatch_, nray, 3});
+      normal_ptr = static_cast<mjtNum*>(arr.request().ptr);
+      normal_obj = std::move(arr);
+    }
+
+    {
+      py::gil_scoped_release no_gil;
+      if (nthread_ > 0 && nbatch_ > 1) {
+        int chunk = chunk_size.has_value()
+                        ? *chunk_size
+                        : std::max(1, nbatch_ / (10 * nthread_));
+        InterceptMjErrors(_unsafe_multi_ray_threaded)(
+            models_, worker_data_, nbatch_, state0_ptr, pnt_ptr, pnt_batched,
+            vec_ptr, vec_batched, geomgroup_ptr, flg_static, bodyexclude_ptr,
+            bodyexclude_batched, nray, cutoff, geomid_ptr, dist_ptr, normal_ptr,
+            pool_.get(), chunk);
+      } else {
+        InterceptMjErrors(_unsafe_multi_ray_range)(
+            models_, worker_data_[0], 0, nbatch_, state0_ptr, pnt_ptr,
+            pnt_batched, vec_ptr, vec_batched, geomgroup_ptr, flg_static,
+            bodyexclude_ptr, bodyexclude_batched, nray, cutoff, geomid_ptr,
+            dist_ptr, normal_ptr);
+      }
+    }
+
+    return py::make_tuple(dist_out, geomid_out, normal_obj);
+  }
+
+  // -----------------------------------------------------------------
   // MuJoCo hfield bilinear sampler.
   //
   //   state0:          (nbatch, nstate)
@@ -1850,6 +2096,11 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("jacp") = true, py::arg("jacr") = false,
            py::arg("warmstart0") = py::none(),
            py::arg("chunk_size") = py::none())
+      .def("multi_ray", &BatchEnvPool::multi_ray, py::kw_only(),
+           py::arg("state0"), py::arg("pnt"), py::arg("vec"),
+           py::arg("geomgroup") = py::none(), py::arg("flg_static") = 1,
+           py::arg("bodyexclude"), py::arg("return_normal") = false,
+           py::arg("cutoff") = mjMAXVAL, py::arg("chunk_size") = py::none())
       .def("sample_hfield_height", &BatchEnvPool::sample_hfield_height,
            py::kw_only(), py::arg("state0"), py::arg("hfield_geom_id"),
            py::arg("offsets"), py::arg("frame_body_id"),

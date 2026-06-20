@@ -412,6 +412,118 @@ class BatchEnvPool:
         chunk_size=chunk_size,
     )
 
+  # -- batched multi-ray --------------------------------------------
+  def multi_ray(
+      self,
+      initial_state,
+      pnt,
+      vec,
+      *,
+      geomgroup=None,
+      flg_static: int = 1,
+      bodyexclude: int | Sequence[int] = -1,
+      return_normal: bool = False,
+      cutoff: float = float(mujoco.mjMAXVAL),
+      chunk_size: Optional[int] = None,
+  ):
+    """Run ``mj_multiRay`` over the full env pool in parallel.
+
+    Per environment this sets ``initial_state`` on the pool-owned model/data,
+    runs the minimum position-stage prefix required by MuJoCo ray casting, and
+    then calls ``mj_multiRay`` once for that environment.
+
+    Args:
+      initial_state: ``(nbatch, nstate)`` full-physics states.
+      pnt: ray origins, shape ``(3,)`` shared across envs or
+        ``(nbatch, 3)`` per environment.
+      vec: ray directions, shape ``(nray, 3)`` shared across envs or
+        ``(nbatch, nray, 3)`` per environment.
+      geomgroup: optional geom visibility mask with shape ``(mjNGROUP,)``.
+      flg_static: forwarded to ``mj_multiRay``.
+      bodyexclude: scalar body id shared across envs or ``(nbatch,)``.
+      return_normal: whether to return surface normals.
+      cutoff: forwarded to ``mj_multiRay``.
+      chunk_size: thread-pool chunk size, optional.
+
+    Returns:
+      ``(dist, geomid, normal)`` where ``dist`` and ``geomid`` have shape
+      ``(nbatch, nray)`` and ``normal`` is either ``None`` or
+      ``(nbatch, nray, 3)``.
+    """
+    if self._pool is None:
+      raise RuntimeError("multi_ray requested after pool close")
+
+    initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
+    if initial_state.shape != (self.nbatch, self.nstate):
+      raise ValueError(
+          f"initial_state must have shape (nbatch={self.nbatch}, "
+          f"nstate={self.nstate}), got {initial_state.shape}"
+      )
+
+    pnt = np.ascontiguousarray(pnt, dtype=np.float64)
+    if pnt.shape != (3,) and pnt.shape != (self.nbatch, 3):
+      raise ValueError(
+          f"pnt must have shape (3,) or (nbatch={self.nbatch}, 3), "
+          f"got {pnt.shape}"
+      )
+
+    vec = np.ascontiguousarray(vec, dtype=np.float64)
+    if vec.ndim == 2:
+      if vec.shape[1] != 3:
+        raise ValueError(f"vec must have shape (nray, 3), got {vec.shape}")
+    elif vec.ndim == 3:
+      if vec.shape[0] != self.nbatch or vec.shape[2] != 3:
+        raise ValueError(
+            f"vec must have shape (nray, 3) or (nbatch={self.nbatch}, nray, 3), "
+            f"got {vec.shape}"
+        )
+    else:
+      raise ValueError(
+          f"vec must have shape (nray, 3) or (nbatch={self.nbatch}, nray, 3), "
+          f"got {vec.shape}"
+      )
+    if vec.shape[-2] == 0:
+      raise ValueError("vec must contain at least one ray")
+
+    if geomgroup is not None:
+      geomgroup = np.ascontiguousarray(geomgroup, dtype=np.uint8)
+      if geomgroup.shape != (mujoco.mjNGROUP,):
+        raise ValueError(
+            f"geomgroup must have shape ({mujoco.mjNGROUP},), got {geomgroup.shape}"
+        )
+
+    if isinstance(bodyexclude, (bool, np.bool_)):
+      raise TypeError("bodyexclude must be an integer id or a 1-D integer array")
+    if isinstance(bodyexclude, numbers.Integral):
+      bodyexclude = np.asarray([int(bodyexclude)], dtype=np.int32)
+    else:
+      arr = np.asarray(bodyexclude)
+      if arr.dtype.kind not in ("i", "u"):
+        raise TypeError("bodyexclude must contain integers")
+      bodyexclude = np.ascontiguousarray(arr, dtype=np.int32)
+      if bodyexclude.ndim != 1:
+        raise ValueError(f"bodyexclude must be 1-D, got {bodyexclude.shape}")
+      if bodyexclude.shape[0] not in (1, self.nbatch):
+        raise ValueError(
+            f"bodyexclude must have shape (1,) or (nbatch={self.nbatch},), "
+            f"got {bodyexclude.shape}"
+        )
+
+    if chunk_size is not None and chunk_size <= 0:
+      raise ValueError("chunk_size must be positive")
+
+    return self._pool.multi_ray(
+        state0=initial_state,
+        pnt=pnt,
+        vec=vec,
+        geomgroup=geomgroup,
+        flg_static=int(flg_static),
+        bodyexclude=bodyexclude,
+        return_normal=bool(return_normal),
+        cutoff=float(cutoff),
+        chunk_size=chunk_size,
+    )
+
   # -- sparse reset ---------------------------------------------------
   def reset(
       self,
