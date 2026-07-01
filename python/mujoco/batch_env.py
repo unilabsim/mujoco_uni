@@ -96,6 +96,9 @@ def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
   return np.ascontiguousarray(arr.reshape(-1), dtype=np.float64)
 
 
+_VALID_NUMA_POLICIES = ("off", "pin")
+
+
 class BatchEnvPool:
   """Persistent per-environment model pool with step / forward / reset."""
 
@@ -105,6 +108,9 @@ class BatchEnvPool:
       *,
       nbatch: int,
       nthread: Optional[int] = None,
+      numa_policy: str = "off",
+      cpu_ids: Optional[Sequence[int]] = None,
+      first_touch: bool = True,
   ):
     """Construct a batch pool from one model or a compatible model sequence.
 
@@ -113,14 +119,63 @@ class BatchEnvPool:
         sequence of ``MjModel`` instances with length ``1`` or ``nbatch``.
       nbatch: Number of environments in the pool.
       nthread: Number of worker threads. ``None`` means ``0``.
+      numa_policy: ``"off"`` (default) leaves worker CPU affinity untouched.
+        ``"pin"`` pins worker ``i`` to ``cpu_ids[i]`` on Linux via
+        ``pthread_setaffinity_np``; other platforms silently no-op.
+        ``"partitioned"`` is reserved for Phase 2 (multi-pool /
+        per-partition queue) and is rejected here.
+      cpu_ids: Optional length-``nthread`` sequence of CPU ids. Required
+        when ``numa_policy='pin'``, must be omitted otherwise.
+      first_touch: Reserved for Phase 3 NUMA-local buffer initialization.
+        Accepted for forward compatibility; currently a no-op.
     """
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
     if not isinstance(model, mujoco.MjModel):
       model = list(model)
     self._nthread = 0 if nthread is None else int(nthread)
+
+    if numa_policy not in _VALID_NUMA_POLICIES:
+      if numa_policy == "partitioned":
+        raise ValueError(
+            "numa_policy='partitioned' is reserved for Phase 2 and is not "
+            "yet implemented; use 'off' or 'pin'"
+        )
+      raise ValueError(
+          f"numa_policy must be one of {_VALID_NUMA_POLICIES}, "
+          f"got {numa_policy!r}"
+      )
+
+    cpu_ids_list: list[int] = []
+    if numa_policy == "pin":
+      if self._nthread <= 0:
+        raise ValueError("numa_policy='pin' requires nthread > 0")
+      if cpu_ids is None:
+        raise ValueError("numa_policy='pin' requires cpu_ids")
+      cpu_ids_list = [int(c) for c in cpu_ids]
+      if len(cpu_ids_list) != self._nthread:
+        raise ValueError(
+            f"cpu_ids must have length nthread={self._nthread}, "
+            f"got {len(cpu_ids_list)}"
+        )
+      if any(c < 0 for c in cpu_ids_list):
+        raise ValueError("cpu_ids must be non-negative")
+    elif cpu_ids is not None:
+      raise ValueError(
+          "cpu_ids is only meaningful when numa_policy='pin'"
+      )
+
+    self._numa_policy = numa_policy
+    self._cpu_ids: tuple[int, ...] = tuple(cpu_ids_list)
+    self._first_touch = bool(first_touch)
+
     self._pool = _native.BatchEnvPool(
-        model=model, nbatch=int(nbatch), nthread=self._nthread
+        model=model,
+        nbatch=int(nbatch),
+        nthread=self._nthread,
+        numa_policy=self._numa_policy,
+        cpu_ids=cpu_ids_list,
+        first_touch=self._first_touch,
     )
 
   def __enter__(self) -> "BatchEnvPool":
@@ -154,6 +209,34 @@ class BatchEnvPool:
   @property
   def nsensordata(self) -> int:
     return self._pool.nsensordata
+
+  @property
+  def numa_policy(self) -> str:
+    return self._numa_policy
+
+  @property
+  def cpu_ids(self) -> tuple[int, ...]:
+    return self._cpu_ids
+
+  @property
+  def first_touch(self) -> bool:
+    return self._first_touch
+
+  @property
+  def worker_affinities(self) -> tuple[tuple[int, ...], ...]:
+    """Observed per-worker CPU affinity mask, as read from the OS.
+
+    Empty tuple means "no affinity information available": either
+    ``numa_policy != 'pin'``, ``nthread == 0``, or the platform has no
+    affinity API (macOS / Windows). On Linux with ``numa_policy='pin'``
+    the constructor guarantees ``worker_affinities[i] == (cpu_ids[i],)``
+    for every worker; if the kernel rejects the pinning request the
+    constructor raises ``ValueError`` instead of returning a
+    partially-pinned pool.
+    """
+    if self._pool is None:
+      raise RuntimeError("worker_affinities requested after pool close")
+    return tuple(tuple(mask) for mask in self._pool.worker_affinities)
 
   def get_all_models(self) -> list[mujoco.MjModel]:
     """Return references to all pool-owned models without copying."""

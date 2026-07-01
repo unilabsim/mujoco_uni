@@ -33,10 +33,31 @@ class ThreadPool {
   // constructor
   explicit ThreadPool(int num_threads);
 
+  // Constructor with optional per-worker CPU affinity. If worker_cpu_ids is
+  // non-empty, its size must equal num_threads (mismatch throws). On Linux
+  // each worker is pinned to its requested CPU via pthread_setaffinity_np;
+  // if the syscall fails the constructor throws std::runtime_error after
+  // joining any already-launched workers. Phase 1 acceptance requires
+  // "worker fixed on requested CPU" as a hard invariant, so silent
+  // fallback is only allowed on platforms without an affinity API (in
+  // that case WorkerAffinities() returns an empty vector so callers can
+  // detect the fallback).
+  ThreadPool(int num_threads, std::vector<int> worker_cpu_ids);
+
   // destructor
   ~ThreadPool();
 
   int NumThreads() const { return threads_.size(); }
+
+  // Per-worker observed CPU affinity mask read back after pinning. Empty
+  // outer vector means "no affinity information available" (either
+  // pinning was not requested, or the platform has no affinity API).
+  // On Linux, entry i is the set of CPU ids that pthread_getaffinity_np
+  // reported for worker i. Tests can assert
+  // WorkerAffinities()[i] == {worker_cpu_ids[i]}.
+  const std::vector<std::vector<int>>& WorkerAffinities() const {
+    return worker_affinities_;
+  }
 
   // returns an ID between 0 and NumThreads() - 1. must be called within
   // worker thread (returns -1 if not).
@@ -68,6 +89,9 @@ class ThreadPool {
 
   // ----- members ----- //
   std::vector<std::thread> threads_;
+  // Observed CPU mask per worker after pinning. Outer size 0 means "no
+  // pinning attempted or platform has no affinity API".
+  std::vector<std::vector<int>> worker_affinities_;
   std::mutex m_;
   std::condition_variable cv_in_;
   std::condition_variable cv_ext_;

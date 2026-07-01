@@ -1222,13 +1222,48 @@ mjtNum* required_array_ptr(const PyCArray& arr, const char* name,
 
 class BatchEnvPool {
  public:
-  BatchEnvPool(py::object model_obj, int nbatch, int nthread)
-      : nbatch_(nbatch), nthread_(nthread) {
+  BatchEnvPool(py::object model_obj, int nbatch, int nthread,
+               const std::string& numa_policy, std::vector<int> cpu_ids,
+               bool first_touch)
+      : nbatch_(nbatch),
+        nthread_(nthread),
+        numa_policy_(numa_policy),
+        first_touch_(first_touch) {
     if (nbatch_ <= 0) {
       throw py::value_error("nbatch must be positive");
     }
     if (nthread_ < 0) {
       throw py::value_error("nthread must be >= 0");
+    }
+    // Phase 1 accepts "off" (default) and "pin". "partitioned" is reserved
+    // for Phase 2 (multi-pool / per-partition queue); reject early with a
+    // clear pointer instead of silently degrading.
+    if (numa_policy_ != "off" && numa_policy_ != "pin") {
+      if (numa_policy_ == "partitioned") {
+        throw py::value_error(
+            "numa_policy='partitioned' is reserved for Phase 2 and is not "
+            "yet implemented; use 'off' or 'pin'");
+      }
+      throw py::value_error(
+          "numa_policy must be one of {'off', 'pin'}");
+    }
+    if (numa_policy_ == "pin") {
+      if (nthread_ == 0) {
+        throw py::value_error(
+            "numa_policy='pin' requires nthread > 0");
+      }
+      if (static_cast<int>(cpu_ids.size()) != nthread_) {
+        throw py::value_error(
+            "numa_policy='pin' requires cpu_ids of length nthread");
+      }
+      for (int cpu : cpu_ids) {
+        if (cpu < 0) {
+          throw py::value_error("cpu_ids must be non-negative");
+        }
+      }
+    } else if (!cpu_ids.empty()) {
+      throw py::value_error(
+          "cpu_ids is only meaningful when numa_policy='pin'");
     }
 
     std::vector<const raw::MjModel*> src_models =
@@ -1295,7 +1330,28 @@ class BatchEnvPool {
     }
 
     if (nthread_ > 0) {
-      pool_ = std::make_shared<ThreadPool>(nthread_);
+      try {
+        if (numa_policy_ == "pin") {
+          pool_ = std::make_shared<ThreadPool>(nthread_, std::move(cpu_ids));
+        } else {
+          pool_ = std::make_shared<ThreadPool>(nthread_);
+        }
+      } catch (const std::exception& e) {
+        // Bubble up as py::value_error so Python callers see a normal
+        // ValueError (not a bare std::runtime_error). Clean up already-
+        // allocated mjModel / mjData first.
+        for (raw::MjData* d : worker_data_) {
+          if (d) mj_deleteData(d);
+        }
+        worker_data_.clear();
+        for (raw::MjModel* m : owned_models_) {
+          if (m) mj_deleteModel(m);
+        }
+        owned_models_.clear();
+        model_refcounts_.clear();
+        models_.clear();
+        throw py::value_error(e.what());
+      }
     }
 
     // Cache sizes.
@@ -1944,6 +2000,19 @@ class BatchEnvPool {
   int nstate() const { return nstate_; }
   int nv() const { return nv_; }
   int nsensordata() const { return nsensordata_; }
+  const std::string& numa_policy() const { return numa_policy_; }
+  bool first_touch() const { return first_touch_; }
+
+  // Observed CPU affinity mask for each worker thread, as read back from
+  // the OS after pinning. Empty outer list means "no affinity information
+  // available" — either pinning was not requested, nthread == 0, or the
+  // platform has no affinity API (macOS / Windows). Tests can assert
+  // worker_affinities()[i] == [cpu_ids[i]] to verify the kernel actually
+  // pinned worker i to the requested CPU.
+  std::vector<std::vector<int>> worker_affinities() const {
+    if (!pool_) return {};
+    return pool_->WorkerAffinities();
+  }
 
   py::object get_model(int env_id) {
     ValidateEnvIdOrThrow(env_id, nbatch_);
@@ -2059,6 +2128,8 @@ class BatchEnvPool {
  private:
   int nbatch_;
   int nthread_;
+  std::string numa_policy_ = "off";
+  bool first_touch_ = false;
   int nstate_ = 0;
   int nv_ = 0;
   int nsensordata_ = 0;
@@ -2071,11 +2142,17 @@ class BatchEnvPool {
 
 PYBIND11_MODULE(_batch_env, pymodule) {
   py::class_<BatchEnvPool>(pymodule, "BatchEnvPool")
-      .def(py::init([](py::object base_model, int nbatch, int nthread) {
-             return std::make_unique<BatchEnvPool>(base_model, nbatch, nthread);
+      .def(py::init([](py::object base_model, int nbatch, int nthread,
+                       std::string numa_policy, std::vector<int> cpu_ids,
+                       bool first_touch) {
+             return std::make_unique<BatchEnvPool>(
+                 base_model, nbatch, nthread, numa_policy, std::move(cpu_ids),
+                 first_touch);
            }),
            py::kw_only(), py::arg("model"), py::arg("nbatch"),
-           py::arg("nthread"))
+           py::arg("nthread"), py::arg("numa_policy") = "off",
+           py::arg("cpu_ids") = std::vector<int>{},
+           py::arg("first_touch") = true)
       .def("step", &BatchEnvPool::step, py::kw_only(), py::arg("nstep"),
            py::arg("control_spec"), py::arg("state0"),
            py::arg("warmstart0") = py::none(),
@@ -2120,7 +2197,11 @@ PYBIND11_MODULE(_batch_env, pymodule) {
       .def_property_readonly("nthread", &BatchEnvPool::nthread)
       .def_property_readonly("nstate", &BatchEnvPool::nstate)
       .def_property_readonly("nv", &BatchEnvPool::nv)
-      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata);
+      .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata)
+      .def_property_readonly("numa_policy", &BatchEnvPool::numa_policy)
+      .def_property_readonly("first_touch", &BatchEnvPool::first_touch)
+      .def_property_readonly("worker_affinities",
+                             &BatchEnvPool::worker_affinities);
 
   pymodule.attr("SUPPORTED_FIELDS") = []() {
     py::list out;

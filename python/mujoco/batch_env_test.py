@@ -1415,5 +1415,194 @@ class JacobianTest(parameterized.TestCase):
         pool.compute_site_jacobians(bad, [0], jacp=True)
 
 
+import os as _os
+import sys as _sys
+
+
+def _linux_allowed_cpus():
+  """Return the CPU ids this process is allowed to run on, on Linux."""
+  if _sys.platform != "linux":
+    return []
+  return sorted(_os.sched_getaffinity(0))
+
+
+class NumaPolicyTest(absltest.TestCase):
+  """Phase 1 NUMA policy plumbing: numa_policy / cpu_ids / first_touch."""
+
+  def test_default_policy_is_off(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=2) as pool:
+      self.assertEqual(pool.numa_policy, "off")
+      self.assertEqual(pool.cpu_ids, ())
+      self.assertTrue(pool.first_touch)
+
+  def test_pin_requires_cpu_ids(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(model, nbatch=2, nthread=2, numa_policy="pin")
+
+  def test_pin_requires_matching_length(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(
+          model, nbatch=2, nthread=2, numa_policy="pin", cpu_ids=[0]
+      )
+
+  def test_pin_requires_positive_nthread(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(
+          model, nbatch=2, nthread=0, numa_policy="pin", cpu_ids=[]
+      )
+
+  def test_cpu_ids_without_pin_rejected(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(model, nbatch=2, nthread=2, cpu_ids=[0, 1])
+
+  def test_negative_cpu_id_rejected(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(
+          model, nbatch=2, nthread=2, numa_policy="pin", cpu_ids=[0, -1]
+      )
+
+  def test_partitioned_policy_rejected_in_phase1(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaisesRegex(ValueError, "Phase 2"):
+      batch_env.BatchEnvPool(
+          model, nbatch=2, nthread=2, numa_policy="partitioned"
+      )
+
+  def test_unknown_policy_rejected(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaises(ValueError):
+      batch_env.BatchEnvPool(model, nbatch=2, nthread=2, numa_policy="numa")
+
+  def test_worker_affinities_off_policy_is_empty(self):
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with batch_env.BatchEnvPool(model, nbatch=2, nthread=2) as pool:
+      self.assertEqual(pool.worker_affinities, ())
+
+  def test_worker_affinities_nonlinux_reports_fallback(self):
+    if _sys.platform == "linux":
+      self.skipTest("Linux has an affinity API; fallback path is not exercised")
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    # On macOS / Windows, numa_policy='pin' is accepted but the platform
+    # has no affinity API. worker_affinities must be empty so callers can
+    # detect the fallback rather than silently assuming pinning worked.
+    with batch_env.BatchEnvPool(
+        model, nbatch=2, nthread=2, numa_policy="pin", cpu_ids=[0, 1]
+    ) as pool:
+      self.assertEqual(pool.numa_policy, "pin")
+      self.assertEqual(pool.worker_affinities, ())
+
+  def test_linux_pin_actually_pins_workers(self):
+    """On Linux, verify each worker's observed mask matches the request.
+
+    This is the hard Phase 1 acceptance criterion ("worker fixed on
+    requested CPU"). We read the OS-reported affinity via
+    ``pool.worker_affinities`` and assert it is the singleton set
+    ``{cpu_ids[i]}`` for every worker.
+    """
+    if _sys.platform != "linux":
+      self.skipTest("affinity API is Linux-only")
+    allowed = _linux_allowed_cpus()
+    if len(allowed) < 2:
+      self.skipTest(
+          f"need at least 2 online CPUs, cgroup allows {allowed}"
+      )
+    cpu_ids = [allowed[0], allowed[1]]
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with batch_env.BatchEnvPool(
+        model,
+        nbatch=4,
+        nthread=2,
+        numa_policy="pin",
+        cpu_ids=cpu_ids,
+    ) as pool:
+      affinities = pool.worker_affinities
+      self.assertLen(affinities, 2)
+      self.assertEqual(affinities[0], (cpu_ids[0],))
+      self.assertEqual(affinities[1], (cpu_ids[1],))
+
+  def test_linux_pin_invalid_cpu_raises(self):
+    """On Linux, requesting a CPU the kernel rejects must fail loud."""
+    if _sys.platform != "linux":
+      self.skipTest("affinity API is Linux-only")
+    # Pick a CPU id that is (almost certainly) not in the process's
+    # allowed set. sched_setaffinity rejects requests whose mask has no
+    # intersection with the cpuset. CPU_SETSIZE - 1 is 1023, well above
+    # any realistic core count and outside any cgroup.
+    bogus_cpu = 1023
+    allowed = set(_linux_allowed_cpus())
+    if bogus_cpu in allowed:
+      self.skipTest(
+          f"cpu {bogus_cpu} unexpectedly allowed; cannot exercise failure"
+      )
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    with self.assertRaisesRegex(
+        ValueError, "pthread_setaffinity_np|worker"
+    ):
+      batch_env.BatchEnvPool(
+          model,
+          nbatch=2,
+          nthread=2,
+          numa_policy="pin",
+          cpu_ids=[bogus_cpu, bogus_cpu],
+      )
+
+  def test_pin_step_runs_and_matches_off_policy(self):
+    """With policy='pin', step() must produce the same result as policy='off'.
+
+    On non-Linux platforms this exercises the fallback path (affinity syscall
+    is a no-op). On Linux it exercises the real pinning path when the
+    requested CPUs are available.
+    """
+    model = mujoco.MjModel.from_xml_string(TEST_XML)
+    nbatch = 4
+    nthread = 2
+    nstep = 3
+    ncontrol = model.nu
+
+    rng = np.random.default_rng(0)
+    state0 = _rand_state(model, nbatch, rng)
+    control = rng.uniform(size=(nbatch, nstep, ncontrol))
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=nthread) as pool:
+      s_ref, sd_ref = pool.step(
+          state0, nstep=nstep, control=control, return_sensor=True
+      )
+
+    # On Linux, pick two CPUs actually allowed to the process (cgroup
+    # or taskset restrictions can shrink this set). On other platforms
+    # any small ids work because the syscall is a no-op.
+    if _sys.platform == "linux":
+      allowed = _linux_allowed_cpus()
+      if len(allowed) < 2:
+        self.skipTest(
+            f"need at least 2 online CPUs, cgroup allows {allowed}"
+        )
+      cpu_ids = [allowed[0], allowed[1]]
+    else:
+      cpu_ids = [0, 1]
+
+    with batch_env.BatchEnvPool(
+        model,
+        nbatch=nbatch,
+        nthread=nthread,
+        numa_policy="pin",
+        cpu_ids=cpu_ids,
+    ) as pool:
+      self.assertEqual(pool.numa_policy, "pin")
+      self.assertEqual(pool.cpu_ids, tuple(cpu_ids))
+      s_pin, sd_pin = pool.step(
+          state0, nstep=nstep, control=control, return_sensor=True
+      )
+
+    np.testing.assert_allclose(s_pin, s_ref, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sd_pin, sd_ref, atol=1e-12, rtol=0)
+
+
 if __name__ == "__main__":
   absltest.main()
