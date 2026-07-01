@@ -1467,9 +1467,11 @@ class NumaPolicyTest(absltest.TestCase):
           model, nbatch=2, nthread=2, numa_policy="pin", cpu_ids=[0, -1]
       )
 
-  def test_partitioned_policy_rejected_in_phase1(self):
+  def test_partitioned_without_partitions_rejected(self):
+    # Phase 2 implements 'partitioned', but it requires a partitions list.
+    # (Full partitioned behavior is covered by PartitionedNumaPolicyTest.)
     model = mujoco.MjModel.from_xml_string(TEST_XML)
-    with self.assertRaisesRegex(ValueError, "Phase 2"):
+    with self.assertRaisesRegex(ValueError, "requires a partitions list"):
       batch_env.BatchEnvPool(
           model, nbatch=2, nthread=2, numa_policy="partitioned"
       )
@@ -1602,6 +1604,291 @@ class NumaPolicyTest(absltest.TestCase):
 
     np.testing.assert_allclose(s_pin, s_ref, atol=1e-12, rtol=0)
     np.testing.assert_allclose(sd_pin, sd_ref, atol=1e-12, rtol=0)
+
+
+class PartitionedNumaPolicyTest(absltest.TestCase):
+  """Phase 2 numa_policy='partitioned': per-partition pools + first-touch."""
+
+  def _model(self):
+    return mujoco.MjModel.from_xml_string(TEST_XML)
+
+  # ---- construction validation (pure ValueError, no threads needed) ----
+
+  def test_partitioned_requires_partitions(self):
+    with self.assertRaisesRegex(ValueError, "requires a partitions list"):
+      batch_env.BatchEnvPool(self._model(), nbatch=4, numa_policy="partitioned")
+
+  def test_partitions_must_start_at_zero(self):
+    parts = [{"env_start": 1, "env_end": 4, "cpu_ids": [0], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "must start at env 0"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partitions_must_cover_nbatch(self):
+    parts = [{"env_start": 0, "env_end": 3, "cpu_ids": [0], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "must cover"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partitions_must_be_contiguous(self):
+    # gap between env 2 and env 3.
+    parts = [
+        {"env_start": 0, "env_end": 2, "cpu_ids": [0], "nthread": 1},
+        {"env_start": 3, "env_end": 4, "cpu_ids": [1], "nthread": 1},
+    ]
+    with self.assertRaisesRegex(ValueError, "contiguous"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partitions_must_not_overlap(self):
+    # env 1..2 covered by both partitions.
+    parts = [
+        {"env_start": 0, "env_end": 2, "cpu_ids": [0], "nthread": 1},
+        {"env_start": 1, "env_end": 4, "cpu_ids": [1], "nthread": 1},
+    ]
+    with self.assertRaisesRegex(ValueError, "contiguous"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partition_requires_positive_nthread(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [], "nthread": 0}]
+    with self.assertRaisesRegex(ValueError, "requires nthread > 0"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partition_cpu_ids_length_mismatch(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [0], "nthread": 2}]
+    with self.assertRaisesRegex(ValueError, "cpu_ids length"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_partition_negative_cpu_id(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [-1], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "non-negative"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  def test_cpu_ids_and_partitions_mutually_exclusive(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [0], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "top-level cpu_ids"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned",
+          cpu_ids=[0], partitions=parts,
+      )
+
+  def test_partitions_rejected_for_off_policy(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [0], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "only valid with"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, nthread=2, partitions=parts
+      )
+
+  def test_partition_dict_bad_keys(self):
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [0]}]  # missing nthread
+    with self.assertRaisesRegex(ValueError, "must be a dict with keys"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  # ---- pinning (Linux only) ----
+
+  def test_partitioned_worker_affinities(self):
+    if _sys.platform != "linux":
+      self.skipTest("affinity API is Linux-only")
+    allowed = _linux_allowed_cpus()
+    if len(allowed) < 4:
+      self.skipTest(f"need >=4 online CPUs, cgroup allows {allowed}")
+    c = allowed[:4]
+    parts = [
+        {"env_start": 0, "env_end": 4, "cpu_ids": [c[0], c[1]], "nthread": 2},
+        {"env_start": 4, "env_end": 8, "cpu_ids": [c[2], c[3]], "nthread": 2},
+    ]
+    with batch_env.BatchEnvPool(
+        self._model(), nbatch=8, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      self.assertEqual(pool.numa_policy, "partitioned")
+      self.assertEqual(pool.nthread, 4)
+      # Affinities are concatenated across partitions in order.
+      self.assertEqual(
+          pool.worker_affinities,
+          ((c[0],), (c[1],), (c[2],), (c[3],)),
+      )
+      # partitions property reflects the normalized plan.
+      self.assertLen(pool.partitions, 2)
+      self.assertEqual(pool.partitions[0]["env_start"], 0)
+      self.assertEqual(pool.partitions[0]["env_end"], 4)
+      self.assertEqual(pool.partitions[1]["cpu_ids"], (c[2], c[3]))
+
+  def test_partitioned_two_numa_nodes(self):
+    """Pin two partitions onto two different NUMA nodes when available."""
+    if _sys.platform != "linux":
+      self.skipTest("affinity API is Linux-only")
+    allowed = set(_linux_allowed_cpus())
+    # node0 low ids, node1 typically starts at cores-per-socket. Use a couple
+    # of well-separated ids and skip if the process isn't allowed on them.
+    want = [0, 1, 80, 81]
+    if not set(want).issubset(allowed):
+      self.skipTest(f"cpus {want} not all allowed; got {sorted(allowed)[:8]}...")
+    parts = [
+        {"env_start": 0, "env_end": 8, "cpu_ids": [0, 1], "nthread": 2},
+        {"env_start": 8, "env_end": 16, "cpu_ids": [80, 81], "nthread": 2},
+    ]
+    with batch_env.BatchEnvPool(
+        self._model(), nbatch=16, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      self.assertEqual(
+          pool.worker_affinities, ((0,), (1,), (80,), (81,))
+      )
+
+  def test_partitioned_invalid_cpu_raises(self):
+    if _sys.platform != "linux":
+      self.skipTest("affinity API is Linux-only")
+    bogus = 1023
+    if bogus in set(_linux_allowed_cpus()):
+      self.skipTest(f"cpu {bogus} unexpectedly allowed")
+    parts = [{"env_start": 0, "env_end": 4, "cpu_ids": [bogus], "nthread": 1}]
+    with self.assertRaisesRegex(ValueError, "pthread_setaffinity_np|worker"):
+      batch_env.BatchEnvPool(
+          self._model(), nbatch=4, numa_policy="partitioned", partitions=parts
+      )
+
+  # ---- numerical equivalence (core correctness gate) ----
+
+  def _partition_cpu_ids(self, nper):
+    """Pick real CPU ids for `nper`-per-partition x 2 partitions, or None."""
+    if _sys.platform != "linux":
+      return [list(range(nper)), list(range(nper, 2 * nper))]
+    allowed = _linux_allowed_cpus()
+    if len(allowed) < 2 * nper:
+      return None
+    return [allowed[:nper], allowed[nper : 2 * nper]]
+
+  def test_partitioned_step_matches_off(self):
+    model = self._model()
+    nbatch, nstep = 8, 3
+    rng = np.random.default_rng(1)
+    state0 = _rand_state(model, nbatch, rng)  # per-env distinct state
+    control = rng.uniform(size=(nbatch, nstep, model.nu))
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=4) as pool:
+      s_ref, sd_ref = pool.step(
+          state0, nstep=nstep, control=control, return_sensor=True
+      )
+
+    cpus = self._partition_cpu_ids(2)
+    if cpus is None:
+      self.skipTest("need >=4 online CPUs")
+    parts = [
+        {"env_start": 0, "env_end": 4, "cpu_ids": cpus[0], "nthread": 2},
+        {"env_start": 4, "env_end": 8, "cpu_ids": cpus[1], "nthread": 2},
+    ]
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      s_p, sd_p = pool.step(
+          state0, nstep=nstep, control=control, return_sensor=True
+      )
+    np.testing.assert_allclose(s_p, s_ref, atol=1e-12, rtol=0)
+    np.testing.assert_allclose(sd_p, sd_ref, atol=1e-12, rtol=0)
+
+  def test_partitioned_forward_matches_off(self):
+    model = self._model()
+    nbatch = 8
+    rng = np.random.default_rng(2)
+    state0 = _rand_state(model, nbatch, rng)
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=4) as pool:
+      sd_ref = pool.forward(state0)
+
+    cpus = self._partition_cpu_ids(2)
+    if cpus is None:
+      self.skipTest("need >=4 online CPUs")
+    parts = [
+        {"env_start": 0, "env_end": 5, "cpu_ids": cpus[0], "nthread": 2},
+        {"env_start": 5, "env_end": 8, "cpu_ids": cpus[1], "nthread": 2},
+    ]
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      sd_p = pool.forward(state0)
+    np.testing.assert_allclose(sd_p, sd_ref, atol=1e-12, rtol=0)
+
+  def test_partitioned_uneven_ranges(self):
+    """Unequal partition sizes exercise per-partition chunk remainders."""
+    model = self._model()
+    nbatch, nstep = 10, 2
+    rng = np.random.default_rng(3)
+    state0 = _rand_state(model, nbatch, rng)
+    control = rng.uniform(size=(nbatch, nstep, model.nu))
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=4) as pool:
+      s_ref = pool.step(state0, nstep=nstep, control=control)
+
+    cpus = self._partition_cpu_ids(2)
+    if cpus is None:
+      self.skipTest("need >=4 online CPUs")
+    parts = [
+        {"env_start": 0, "env_end": 3, "cpu_ids": cpus[0], "nthread": 2},
+        {"env_start": 3, "env_end": 10, "cpu_ids": cpus[1], "nthread": 2},
+    ]
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      s_p = pool.step(state0, nstep=nstep, control=control)
+    np.testing.assert_allclose(s_p, s_ref, atol=1e-12, rtol=0)
+
+  def test_single_partition_degenerate(self):
+    """A single partition spanning [0, nbatch) equals off numerically."""
+    model = self._model()
+    nbatch, nstep = 6, 3
+    rng = np.random.default_rng(4)
+    state0 = _rand_state(model, nbatch, rng)
+    control = rng.uniform(size=(nbatch, nstep, model.nu))
+
+    with batch_env.BatchEnvPool(model, nbatch=nbatch, nthread=2) as pool:
+      s_ref = pool.step(state0, nstep=nstep, control=control)
+
+    if _sys.platform == "linux":
+      allowed = _linux_allowed_cpus()
+      if len(allowed) < 2:
+        self.skipTest("need >=2 online CPUs")
+      cpu = allowed[:2]
+    else:
+      cpu = [0, 1]
+    parts = [{"env_start": 0, "env_end": nbatch, "cpu_ids": cpu, "nthread": 2}]
+    with batch_env.BatchEnvPool(
+        model, nbatch=nbatch, numa_policy="partitioned", partitions=parts
+    ) as pool:
+      self.assertEqual(pool.nthread, 2)
+      s_p = pool.step(state0, nstep=nstep, control=control)
+    np.testing.assert_allclose(s_p, s_ref, atol=1e-12, rtol=0)
+
+  def test_first_touch_flag_roundtrips(self):
+    model = self._model()
+    cpus = self._partition_cpu_ids(1)
+    if cpus is None:
+      self.skipTest("need >=2 online CPUs")
+    parts = [
+        {"env_start": 0, "env_end": 2, "cpu_ids": cpus[0], "nthread": 1},
+        {"env_start": 2, "env_end": 4, "cpu_ids": cpus[1], "nthread": 1},
+    ]
+    for ft in (True, False):
+      with batch_env.BatchEnvPool(
+          model, nbatch=4, numa_policy="partitioned",
+          partitions=parts, first_touch=ft,
+      ) as pool:
+        self.assertEqual(pool.first_touch, ft)
+        # step still runs correctly regardless of allocation site.
+        rng = np.random.default_rng(5)
+        state0 = _rand_state(model, 4, rng)
+        pool.step(state0, nstep=1)
 
 
 if __name__ == "__main__":

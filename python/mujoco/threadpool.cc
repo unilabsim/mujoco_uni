@@ -14,6 +14,7 @@
 
 #include "threadpool.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -149,6 +150,37 @@ void ThreadPool::Schedule(std::function<void()> task) {
   std::unique_lock<std::mutex> lock(m_);
   queue_.push(std::move(task));
   cv_in_.notify_one();
+}
+
+// Run fn exactly once on each worker, blocking until all have completed.
+void ThreadPool::RunOnEachWorker(const std::function<void(int)>& fn) {
+  const int n = NumThreads();
+  if (n == 0) return;
+
+  // Barrier shared by the n init tasks. Lives on this (non-worker) stack
+  // frame; safe because we block in WaitCount(n) below until every task has
+  // completed, so no task outlives these locals.
+  std::mutex barrier_mutex;
+  std::condition_variable barrier_cv;
+  int arrived = 0;
+
+  ResetCount();
+  for (int i = 0; i < n; ++i) {
+    Schedule([&]() {
+      fn(WorkerId());
+      // Do not let this task return until all n workers have entered the
+      // barrier. Because a worker only returns to the dequeue loop after its
+      // task returns, this guarantees every worker pops exactly one init task
+      // (a fast worker cannot grab a second and starve a slower one).
+      std::unique_lock<std::mutex> lock(barrier_mutex);
+      if (++arrived == n) {
+        barrier_cv.notify_all();
+      } else {
+        barrier_cv.wait(lock, [&]() { return arrived == n; });
+      }
+    });
+  }
+  WaitCount(n);
 }
 
 // ThreadPool worker

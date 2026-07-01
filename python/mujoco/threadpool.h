@@ -79,6 +79,24 @@ class ThreadPool {
     cv_ext_.wait(lock, [&]() { return this->GetCount() >= value; });
   }
 
+  // Run `fn(worker_id)` exactly once on every worker thread, then block until
+  // all workers have finished. Used for NUMA-local first-touch initialization
+  // so that per-worker memory (e.g. each worker's mjData) is allocated on the
+  // thread that will use it, after that thread has been pinned.
+  //
+  // Implemented as a barrier-gated fan-out: exactly NumThreads() tasks are
+  // scheduled, each keyed by its own WorkerId(). A task cannot complete until
+  // every worker id has entered the barrier, so no worker can pop a second
+  // task before a slower worker has run its first. This forces a strict 1:1
+  // worker<->task mapping (a plain "schedule N tasks" does NOT, because a fast
+  // worker may dequeue two while another sleeps). There are exactly
+  // NumThreads() tasks and NumThreads() workers, so all can be in flight at
+  // once and the barrier releases when the last arrives — no deadlock.
+  //
+  // Must not be called from within a worker thread. No-op when NumThreads()
+  // is 0.
+  void RunOnEachWorker(const std::function<void(int)>& fn);
+
  private:
   // ----- methods ----- //
 

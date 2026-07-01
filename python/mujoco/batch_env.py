@@ -96,7 +96,8 @@ def _normalize_indexed_value(name: str, scalar_index: bool, nindex: int, value):
   return np.ascontiguousarray(arr.reshape(-1), dtype=np.float64)
 
 
-_VALID_NUMA_POLICIES = ("off", "pin")
+_VALID_NUMA_POLICIES = ("off", "pin", "partitioned")
+_PARTITION_KEYS = frozenset({"env_start", "env_end", "cpu_ids", "nthread"})
 
 
 class BatchEnvPool:
@@ -111,6 +112,7 @@ class BatchEnvPool:
       numa_policy: str = "off",
       cpu_ids: Optional[Sequence[int]] = None,
       first_touch: bool = True,
+      partitions: Optional[Sequence[Dict[str, Any]]] = None,
   ):
     """Construct a batch pool from one model or a compatible model sequence.
 
@@ -118,16 +120,26 @@ class BatchEnvPool:
       model: A single ``MjModel`` to clone across the pool, or a compatible
         sequence of ``MjModel`` instances with length ``1`` or ``nbatch``.
       nbatch: Number of environments in the pool.
-      nthread: Number of worker threads. ``None`` means ``0``.
+      nthread: Number of worker threads. ``None`` means ``0``. Ignored (and
+        derived from ``partitions``) when ``numa_policy='partitioned'``.
       numa_policy: ``"off"`` (default) leaves worker CPU affinity untouched.
         ``"pin"`` pins worker ``i`` to ``cpu_ids[i]`` on Linux via
         ``pthread_setaffinity_np``; other platforms silently no-op.
-        ``"partitioned"`` is reserved for Phase 2 (multi-pool /
-        per-partition queue) and is rejected here.
+        ``"partitioned"`` splits ``[0, nbatch)`` into contiguous env ranges,
+        each served by its own pinned ThreadPool and NUMA-local mjData
+        (see ``partitions``).
       cpu_ids: Optional length-``nthread`` sequence of CPU ids. Required
-        when ``numa_policy='pin'``, must be omitted otherwise.
-      first_touch: Reserved for Phase 3 NUMA-local buffer initialization.
-        Accepted for forward compatibility; currently a no-op.
+        when ``numa_policy='pin'``, must be omitted otherwise. Must be omitted
+        when ``numa_policy='partitioned'`` (specify cpu_ids per partition).
+      first_touch: When true (default), each worker allocates its own mjData
+        on the thread/CPU it runs on so that (under pinning) the memory is
+        NUMA-local. When false, mjData is allocated on the constructing
+        thread. Numerically identical either way.
+      partitions: Required when ``numa_policy='partitioned'``: a sequence of
+        dicts, each ``{'env_start', 'env_end', 'cpu_ids', 'nthread'}``. The
+        env ranges must be contiguous and cover ``[0, nbatch)`` exactly; each
+        partition pins ``nthread`` workers to its ``cpu_ids``. Must be omitted
+        for other policies.
     """
     if nbatch <= 0:
       raise ValueError("nbatch must be positive")
@@ -136,17 +148,26 @@ class BatchEnvPool:
     self._nthread = 0 if nthread is None else int(nthread)
 
     if numa_policy not in _VALID_NUMA_POLICIES:
-      if numa_policy == "partitioned":
-        raise ValueError(
-            "numa_policy='partitioned' is reserved for Phase 2 and is not "
-            "yet implemented; use 'off' or 'pin'"
-        )
       raise ValueError(
           f"numa_policy must be one of {_VALID_NUMA_POLICIES}, "
           f"got {numa_policy!r}"
       )
 
+    if numa_policy != "partitioned" and partitions is not None:
+      raise ValueError(
+          "partitions is only valid with numa_policy='partitioned'"
+      )
+
     cpu_ids_list: list[int] = []
+    # Flat partition arrays passed to the native constructor (empty unless
+    # partitioned). cpu_ids of all partitions are concatenated; the native
+    # side re-slices them by part_nthreads.
+    part_env_starts: list[int] = []
+    part_env_ends: list[int] = []
+    part_nthreads: list[int] = []
+    part_cpu_ids_flat: list[int] = []
+    self._partitions: tuple[Dict[str, Any], ...] = ()
+
     if numa_policy == "pin":
       if self._nthread <= 0:
         raise ValueError("numa_policy='pin' requires nthread > 0")
@@ -160,6 +181,76 @@ class BatchEnvPool:
         )
       if any(c < 0 for c in cpu_ids_list):
         raise ValueError("cpu_ids must be non-negative")
+    elif numa_policy == "partitioned":
+      if cpu_ids is not None:
+        raise ValueError(
+            "top-level cpu_ids is not allowed with numa_policy='partitioned'; "
+            "specify cpu_ids per partition"
+        )
+      if partitions is None:
+        raise ValueError(
+            "numa_policy='partitioned' requires a partitions list"
+        )
+      partitions = list(partitions)
+      if not partitions:
+        raise ValueError(
+            "numa_policy='partitioned' requires a non-empty partitions list"
+        )
+      normalized: list[Dict[str, Any]] = []
+      prev_end = 0
+      for i, part in enumerate(partitions):
+        if not isinstance(part, dict) or set(part.keys()) != _PARTITION_KEYS:
+          raise ValueError(
+              f"partition {i} must be a dict with keys "
+              f"{sorted(_PARTITION_KEYS)}"
+          )
+        env_start = int(part["env_start"])
+        env_end = int(part["env_end"])
+        nt = int(part["nthread"])
+        pcpu = [int(c) for c in part["cpu_ids"]]
+        if i == 0 and env_start != 0:
+          raise ValueError(
+              f"partitions must start at env 0, got env_start={env_start}"
+          )
+        if env_start >= env_end:
+          raise ValueError(
+              f"partition {i} has empty/negative range "
+              f"[{env_start}, {env_end})"
+          )
+        if i > 0 and env_start != prev_end:
+          raise ValueError(
+              f"partition {i} env_start={env_start} must equal previous "
+              f"env_end={prev_end} (ranges must be contiguous, no gaps or "
+              f"overlaps)"
+          )
+        if nt <= 0:
+          raise ValueError(f"partition {i} requires nthread > 0")
+        if len(pcpu) != nt:
+          raise ValueError(
+              f"partition {i} cpu_ids length {len(pcpu)} must equal "
+              f"nthread {nt}"
+          )
+        if any(c < 0 for c in pcpu):
+          raise ValueError(f"partition {i} cpu_ids must be non-negative")
+        prev_end = env_end
+        part_env_starts.append(env_start)
+        part_env_ends.append(env_end)
+        part_nthreads.append(nt)
+        part_cpu_ids_flat.extend(pcpu)
+        normalized.append({
+            "env_start": env_start,
+            "env_end": env_end,
+            "nthread": nt,
+            "cpu_ids": tuple(pcpu),
+        })
+      if prev_end != nbatch:
+        raise ValueError(
+            f"partitions must cover [0, nbatch={nbatch}); last "
+            f"env_end={prev_end}"
+        )
+      # nthread reflects the total worker count across all partitions.
+      self._nthread = int(sum(part_nthreads))
+      self._partitions = tuple(normalized)
     elif cpu_ids is not None:
       raise ValueError(
           "cpu_ids is only meaningful when numa_policy='pin'"
@@ -176,6 +267,10 @@ class BatchEnvPool:
         numa_policy=self._numa_policy,
         cpu_ids=cpu_ids_list,
         first_touch=self._first_touch,
+        part_env_starts=part_env_starts,
+        part_env_ends=part_env_ends,
+        part_nthreads=part_nthreads,
+        part_cpu_ids_flat=part_cpu_ids_flat,
     )
 
   def __enter__(self) -> "BatchEnvPool":
@@ -237,6 +332,18 @@ class BatchEnvPool:
     if self._pool is None:
       raise RuntimeError("worker_affinities requested after pool close")
     return tuple(tuple(mask) for mask in self._pool.worker_affinities)
+
+  @property
+  def partitions(self) -> tuple[Dict[str, Any], ...]:
+    """Effective execution partitions.
+
+    Empty tuple for ``numa_policy != 'partitioned'`` (a "partitioned-only"
+    signal, analogous to ``cpu_ids`` being empty for ``'off'``). For
+    ``'partitioned'`` each entry is a dict
+    ``{'env_start', 'env_end', 'nthread', 'cpu_ids'}`` reflecting the
+    normalized partition plan.
+    """
+    return self._partitions
 
   def get_all_models(self) -> list[mujoco.MjModel]:
     """Return references to all pool-owned models without copying."""
