@@ -309,6 +309,8 @@ class BatchEnvPool:
       chunk_size: Optional[int] = None,
       return_sensor: bool = False,
       post_step_forward_sensor: bool = False,
+      control_callback=None,
+      callback_sensordata: bool = True,
   ):
     """Run ``nstep`` of ``mj_step`` on every environment.
 
@@ -321,13 +323,49 @@ class BatchEnvPool:
       nstep: number of steps.
       control_spec: MuJoCo ``mjtState`` flags for control.
       control: ``(nbatch, nstep, ncontrol)`` control trajectories, optional.
+        Mutually exclusive with ``control_callback``.
       initial_warmstart: ``(nbatch, nv)`` qacc_warmstart, optional.
       chunk_size: thread-pool chunk size, optional.
       return_sensor: return final-step sensordata together with state.
       post_step_forward_sensor: if returning sensors, run one ``mj_forward`` on
         the final state before copying sensordata. This matches the previous
         ``step`` followed by ``forward`` refresh behavior. When false, the
-        sensordata left by the final ``mj_step`` is returned directly.
+        sensordata left by the final ``mj_step`` is returned directly. With
+        ``control_callback`` and ``callback_sensordata=True``, the same
+        refresh is applied to the sensordata passed to the callback after
+        each substep.
+      control_callback: optional callable
+        ``fn(step_index, state, sensordata) -> control`` invoked once before
+        every substep, ``nstep`` times total. At ``step_index == 0``,
+        ``state`` is the ``initial_state`` array as passed to this method
+        and ``sensordata`` is always ``None``: the pool has not re-evaluated
+        sensors since the previous call, so callers needing sensordata for
+        the first control should reuse the sensordata returned by the
+        previous ``step``/``reset``, or call :meth:`forward` first. At
+        ``step_index > 0``, ``state`` is the ``(nbatch, nstate)`` float64
+        state after the previous substep, and ``sensordata`` is the fresh
+        ``(nbatch, nsensordata)`` float64 sensor data when
+        ``callback_sensordata`` is true, else ``None``. These arrays are
+        internal output buffers that are overwritten between rounds; do not
+        mutate them, and copy them if they are needed beyond the callback
+        invocation. The returned ``control`` must be a C-contiguous float64
+        array of shape ``(nbatch, ncontrol)`` with
+        ``ncontrol = mj_stateSize(control_spec)``; it is applied before the
+        next substep via ``mj_setState``. The rollout is numerically
+        equivalent to calling ``step(nstep=1)`` ``nstep`` times, computing
+        control from each returned state. If the callback raises, the
+        exception propagates and the rollout is aborted with the pool's
+        ``mjData`` workers left in an intermediate state.
+      callback_sensordata: when true (default), gather fresh sensordata after
+        every substep and pass it to ``control_callback`` for
+        ``step_index > 0``. When false, no per-substep sensordata is
+        gathered (and no per-substep ``post_step_forward_sensor`` refresh is
+        run) and the callback always receives ``None`` for ``sensordata``;
+        the final-step sensordata is still gathered and returned when
+        ``return_sensor`` is true, with the usual
+        ``post_step_forward_sensor`` refresh applied once. Requires
+        ``control_callback``; passing ``callback_sensordata=False`` without
+        it raises ``ValueError``.
 
     Returns:
       ``state`` array with shape ``(nbatch, nstate)``, or
@@ -337,6 +375,13 @@ class BatchEnvPool:
       raise RuntimeError("step requested after pool close")
     if nstep < 1:
       raise ValueError("nstep must be >= 1")
+    if control_callback is not None:
+      if control is not None:
+        raise ValueError("control and control_callback are mutually exclusive")
+      if not callable(control_callback):
+        raise TypeError("control_callback must be callable")
+    elif not callback_sensordata:
+      raise ValueError("callback_sensordata=False requires control_callback")
 
     initial_state = np.ascontiguousarray(initial_state, dtype=np.float64)
     if initial_state.ndim != 2 or initial_state.shape[0] != self.nbatch:
@@ -360,6 +405,8 @@ class BatchEnvPool:
         chunk_size=chunk_size,
         return_sensor=bool(return_sensor),
         post_step_forward_sensor=bool(post_step_forward_sensor),
+        control_callback=control_callback,
+        callback_sensordata=bool(callback_sensordata),
     )
 
   # -- forward --------------------------------------------------------

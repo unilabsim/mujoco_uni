@@ -721,6 +721,156 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
   pool->WaitCount(njobs);
 }
 
+// One round of the control-callback stepping loop. Every round applies the
+// control produced by callback(t-1) and runs exactly one mj_step. The first
+// round (init=true) performs the full per-call setup of _unsafe_step (zero
+// control components outside control_spec, re-copy mocap/eq_active from the
+// model, scatter state0, set warmstart0 or clear it); later rounds restore
+// the env state from the previous round's gather (the worker mjData was
+// overwritten by later envs in the env loop) and clear qacc_warmstart,
+// matching the per-call setup of step(nstep=1). Warnings are cleared every
+// round for the same parity reason. After stepping, the round gathers state
+// to state_out and — when sensordata_out is not null — gathers sensordata,
+// running the same mj_forward refresh as _unsafe_step when
+// post_step_forward_sensor is true.
+void _unsafe_step_callback_round(const std::vector<const raw::MjModel*>& m,
+                                 raw::MjData* d, int start_roll, int end_roll,
+                                 unsigned int control_spec,
+                                 const mjtNum* state0, const mjtNum* warmstart0,
+                                 const mjtNum* control, bool init,
+                                 mjtNum* state_out, mjtNum* sensordata_out,
+                                 bool post_step_forward_sensor) {
+  size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
+  size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
+  size_t nv = static_cast<size_t>(m[0]->nv);
+  size_t nsensordata = static_cast<size_t>(m[0]->nsensordata);
+  int nbody = m[0]->nbody, neq = m[0]->neq;
+
+  if (init) {
+    if (!(control_spec & mjSTATE_CTRL)) {
+      mju_zero(d->ctrl, m[0]->nu);
+    }
+    if (!(control_spec & mjSTATE_QFRC_APPLIED)) {
+      mju_zero(d->qfrc_applied, nv);
+    }
+    if (!(control_spec & mjSTATE_XFRC_APPLIED)) {
+      mju_zero(d->xfrc_applied, 6 * nbody);
+    }
+  }
+
+  for (size_t r = start_roll; r < static_cast<size_t>(end_roll); r++) {
+    if (init) {
+      if (!(control_spec & mjSTATE_MOCAP_POS)) {
+        for (int i = 0; i < nbody; i++) {
+          int id = m[r]->body_mocapid[i];
+          if (id >= 0) mju_copy3(d->mocap_pos + 3 * id, m[r]->body_pos + 3 * i);
+        }
+      }
+      if (!(control_spec & mjSTATE_MOCAP_QUAT)) {
+        for (int i = 0; i < nbody; i++) {
+          int id = m[r]->body_mocapid[i];
+          if (id >= 0) {
+            mju_copy4(d->mocap_quat + 4 * id, m[r]->body_quat + 4 * i);
+          }
+        }
+      }
+      if (!(control_spec & mjSTATE_EQ_ACTIVE)) {
+        for (int i = 0; i < neq; i++) {
+          d->eq_active[i] = m[r]->eq_active0[i];
+        }
+      }
+
+      mj_setState(m[r], d, state0 + r * nstate, mjSTATE_FULLPHYSICS);
+
+      if (warmstart0) {
+        mju_copy(d->qacc_warmstart, warmstart0 + r * nv, nv);
+      } else {
+        mju_zero(d->qacc_warmstart, nv);
+      }
+    } else {
+      // Restore this env's state from the previous round's gather: the
+      // worker mjData was overwritten by later envs in the env loop. This
+      // matches the per-call path, where every step(nstep=1) call scatters
+      // the previously returned state during setup.
+      mj_setState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+      // Per-call step(nstep=1) clears warmstart during setup; repeat that
+      // here so a callback rollout is exactly equivalent to nstep
+      // individual calls.
+      mju_zero(d->qacc_warmstart, nv);
+    }
+    for (int i = 0; i < mjNWARNING; i++) {
+      d->warning[i].number = 0;
+    }
+
+    if (control) {
+      mj_setState(m[r], d, control + r * ncontrol, control_spec);
+    }
+    mj_step(m[r], d);
+
+    mj_getState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+    if (sensordata_out) {
+      if (post_step_forward_sensor) {
+        mju_zero(d->ctrl, m[r]->nu);
+        mju_zero(d->qfrc_applied, nv);
+        mju_zero(d->xfrc_applied, 6 * nbody);
+        for (int i = 0; i < nbody; i++) {
+          int id = m[r]->body_mocapid[i];
+          if (id >= 0) {
+            mju_copy3(d->mocap_pos + 3 * id, m[r]->body_pos + 3 * i);
+            mju_copy4(d->mocap_quat + 4 * id, m[r]->body_quat + 4 * i);
+          }
+        }
+        for (int i = 0; i < neq; i++) {
+          d->eq_active[i] = m[r]->eq_active0[i];
+        }
+        mj_setState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
+        mju_zero(d->qacc_warmstart, nv);
+        for (int i = 0; i < mjNWARNING; i++) {
+          d->warning[i].number = 0;
+        }
+        mj_forwardSkip(m[r], d, mjSTAGE_NONE, 0);
+      }
+      mju_copy(sensordata_out + r * nsensordata, d->sensordata, nsensordata);
+    }
+  }
+}
+
+void _unsafe_step_callback_round_threaded(
+    const std::vector<const raw::MjModel*>& m, std::vector<raw::MjData*>& d,
+    int nbatch, unsigned int control_spec, const mjtNum* state0,
+    const mjtNum* warmstart0, const mjtNum* control, bool init,
+    mjtNum* state_out, mjtNum* sensordata_out, bool post_step_forward_sensor,
+    ThreadPool* pool, int chunk_size) {
+  int nfulljobs = nbatch / chunk_size;
+  int chunk_remainder = nbatch % chunk_size;
+  int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
+
+  pool->ResetCount();
+
+  for (int j = 0; j < nfulljobs; j++) {
+    auto task = [=, &m, &d](void) {
+      int id = pool->WorkerId();
+      _unsafe_step_callback_round(m, d[id], j * chunk_size,
+                                  (j + 1) * chunk_size, control_spec, state0,
+                                  warmstart0, control, init, state_out,
+                                  sensordata_out, post_step_forward_sensor);
+    };
+    pool->Schedule(task);
+  }
+  if (chunk_remainder > 0) {
+    auto task = [=, &m, &d](void) {
+      _unsafe_step_callback_round(
+          m, d[pool->WorkerId()], nfulljobs * chunk_size,
+          nfulljobs * chunk_size + chunk_remainder, control_spec, state0,
+          warmstart0, control, init, state_out, sensordata_out,
+          post_step_forward_sensor);
+    };
+    pool->Schedule(task);
+  }
+
+  pool->WaitCount(njobs);
+}
+
 // Subset reset kernel. Iterates over env_ids[start, end), applies per-env
 // setup (clears controls/wrench, copies mocap, resets eq_active), then sets
 // the caller's initial state, optionally runs mj_setConst for envs flagged
@@ -1165,6 +1315,37 @@ mjtNum* required_array_ptr(const PyCArray& arr, const char* name,
   return static_cast<mjtNum*>(info.ptr);
 }
 
+// Validate a control_callback return value (2-D C-contiguous float64 array of
+// shape (nbatch, ncontrol)) and copy it into control_ptr for the next round.
+void StoreCallbackControl(const py::object& result, int nbatch, int ncontrol,
+                          mjtNum* control_ptr) {
+  if (!py::isinstance<py::array>(result)) {
+    throw py::value_error(
+        "control_callback must return a numpy.ndarray of shape "
+        "(nbatch, ncontrol)");
+  }
+  py::array result_arr = py::reinterpret_borrow<py::array>(result);
+  if (!py::isinstance<py::array_t<mjtNum>>(result_arr)) {
+    throw py::value_error("control_callback must return a float64 array");
+  }
+  if (!(result_arr.flags() & py::array::c_style)) {
+    throw py::value_error("control_callback must return a C-contiguous array");
+  }
+  py::buffer_info info = result_arr.request();
+  if (info.ndim != 2 || info.shape[0] != nbatch || info.shape[1] != ncontrol) {
+    std::ostringstream msg;
+    msg << "control_callback must return shape (" << nbatch << ", " << ncontrol
+        << "), got (";
+    for (int i = 0; i < info.ndim; ++i) {
+      msg << info.shape[i] << (i + 1 < info.ndim ? ", " : "");
+    }
+    msg << ")";
+    throw py::value_error(msg.str());
+  }
+  mju_copy(control_ptr, static_cast<const mjtNum*>(info.ptr),
+           static_cast<size_t>(nbatch) * ncontrol);
+}
+
 // ===================================================================
 // Pool.
 // ===================================================================
@@ -1327,7 +1508,9 @@ class BatchEnvPool {
                   std::optional<const PyCArray> warmstart0,
                   std::optional<const PyCArray> control,
                   std::optional<int> chunk_size, bool return_sensor,
-                  bool post_step_forward_sensor) {
+                  bool post_step_forward_sensor,
+                  std::optional<py::function> control_callback,
+                  bool callback_sensordata) {
     if (nstep < 1) {
       throw py::value_error("nstep must be >= 1");
     }
@@ -1350,6 +1533,24 @@ class BatchEnvPool {
     mjtNum* state0_ptr = optional_array_ptr(state0_opt, "state0", sz_state0);
     mjtNum* warmstart0_ptr =
         optional_array_ptr(warmstart0, "warmstart0", sz_warmstart);
+
+    if (control_callback.has_value() && control.has_value()) {
+      throw py::value_error(
+          "control and control_callback are mutually exclusive");
+    }
+    if (!control_callback.has_value() && !callback_sensordata) {
+      throw py::value_error(
+          "callback_sensordata=False requires control_callback");
+    }
+
+    if (control_callback.has_value()) {
+      return StepWithControlCallback(nstep, control_spec, state0,
+                                     warmstart0_ptr, chunk_size, return_sensor,
+                                     post_step_forward_sensor,
+                                     callback_sensordata, *control_callback,
+                                     ncontrol);
+    }
+
     mjtNum* control_ptr = nullptr;
     bool control_is_constant = false;
     if (control.has_value()) {
@@ -1889,6 +2090,93 @@ class BatchEnvPool {
   }
 
  private:
+  // Callback-driven stepping: nstep rounds of the callback round kernel.
+  // callback(0) is invoked up front with the caller's initial_state and a
+  // None sensordata (the pool has not re-evaluated sensors since the
+  // previous call); round t (1..nstep) then applies control(t-1) and runs
+  // one mj_step, after which callback(t) is invoked with the fresh state —
+  // and with fresh sensordata when callback_sensordata is true. The Python
+  // callback is only ever invoked from the main thread with the GIL held;
+  // worker threads run pure native kernels. A callback exception aborts the
+  // rollout and propagates to the caller; the pool's mjData workers are left
+  // in an intermediate state.
+  py::object StepWithControlCallback(int nstep, unsigned int control_spec,
+                                     const PyCArray state0,
+                                     const mjtNum* warmstart0_ptr,
+                                     std::optional<int> chunk_size,
+                                     bool return_sensor,
+                                     bool post_step_forward_sensor,
+                                     bool callback_sensordata,
+                                     const py::function& control_callback,
+                                     int ncontrol) {
+    mjtNum* state0_ptr = static_cast<mjtNum*>(state0.request().ptr);
+    PyCArray state_out({nbatch_, nstate_});
+    mjtNum* state_ptr = static_cast<mjtNum*>(state_out.request().ptr);
+    std::optional<PyCArray> sensordata_out;
+    mjtNum* sensordata_ptr = nullptr;
+    if (callback_sensordata || return_sensor) {
+      sensordata_out.emplace(std::vector<py::ssize_t>{nbatch_, nsensordata_});
+      sensordata_ptr =
+          static_cast<mjtNum*>(sensordata_out->request().ptr);
+    }
+    PyCArray control_buf({nbatch_, ncontrol});
+    mjtNum* control_ptr = static_cast<mjtNum*>(control_buf.request().ptr);
+
+    std::vector<const raw::MjModel*> cmodels(nbatch_);
+    for (int i = 0; i < nbatch_; ++i) cmodels[i] = models_[i];
+
+    int chunk = 0;
+    if (nthread_ > 0 && nbatch_ > 1) {
+      chunk = chunk_size.has_value()
+                  ? *chunk_size
+                  : std::max(1, nbatch_ / (10 * nthread_));
+    }
+
+    // callback(0) produces the control applied by the first round.
+    StoreCallbackControl(control_callback(0, state0, py::none()), nbatch_,
+                         ncontrol, control_ptr);
+
+    for (int t = 1; t <= nstep; ++t) {
+      bool init = (t == 1);
+      bool last = (t == nstep);
+      // Intermediate rounds only gather sensordata when the callback
+      // consumes it; the final round gathers when the caller asked for it.
+      mjtNum* round_sensordata_ptr =
+          (last ? return_sensor : callback_sensordata) ? sensordata_ptr
+                                                       : nullptr;
+      {
+        py::gil_scoped_release no_gil;
+        if (nthread_ > 0 && nbatch_ > 1) {
+          InterceptMjErrors(_unsafe_step_callback_round_threaded)(
+              cmodels, worker_data_, nbatch_, control_spec, state0_ptr,
+              warmstart0_ptr, control_ptr, init, state_ptr,
+              round_sensordata_ptr, post_step_forward_sensor, pool_.get(),
+              chunk);
+        } else {
+          InterceptMjErrors(_unsafe_step_callback_round)(
+              cmodels, worker_data_[0], 0, nbatch_, control_spec, state0_ptr,
+              warmstart0_ptr, control_ptr, init, state_ptr,
+              round_sensordata_ptr, post_step_forward_sensor);
+        }
+      }
+      if (last) break;
+
+      // Back on the main thread holding the GIL: invoke the callback and
+      // validate its return before the next round consumes it.
+      py::object sensor_arg = py::none();
+      if (callback_sensordata) {
+        sensor_arg = *sensordata_out;
+      }
+      StoreCallbackControl(control_callback(t, state_out, sensor_arg),
+                           nbatch_, ncontrol, control_ptr);
+    }
+
+    if (return_sensor) {
+      return py::make_tuple(state_out, *sensordata_out);
+    }
+    return state_out;
+  }
+
   int nbatch_;
   int nthread_;
   int nstate_ = 0;
@@ -1919,7 +2207,9 @@ PYBIND11_MODULE(_batch_env, pymodule) {
            py::arg("control") = py::none(),
            py::arg("chunk_size") = py::none(),
            py::arg("return_sensor") = false,
-           py::arg("post_step_forward_sensor") = false)
+           py::arg("post_step_forward_sensor") = false,
+           py::arg("control_callback") = py::none(),
+           py::arg("callback_sensordata") = true)
       .def("forward", &BatchEnvPool::forward, py::kw_only(),
            py::arg("state0"), py::arg("warmstart0") = py::none(),
            py::arg("skipsensor") = false, py::arg("chunk_size") = py::none())

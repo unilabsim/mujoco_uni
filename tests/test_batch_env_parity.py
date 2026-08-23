@@ -375,3 +375,268 @@ def test_repeated_create_step_and_close_loop_stays_finite() -> None:
       pool.close()
 
     pool.close()
+
+
+def _pd_control_from_state(
+    state: np.ndarray, model: mujoco.MjModel, gain: float = 0.5
+) -> np.ndarray:
+  """PD-style control derived from the qvel block of a FULLPHYSICS state.
+
+  The pendulum model has nu == nv, so the (nbatch, nv) qvel block is a valid
+  (nbatch, ncontrol) control for mjSTATE_CTRL.
+  """
+  qvel = state[:, 1 + model.nq : 1 + model.nq + model.nv]
+  return np.ascontiguousarray(-gain * qvel, dtype=np.float64)
+
+
+@pytest.mark.parametrize("nthread,chunk_size", [(0, None), (2, 1), (2, 5)])
+def test_step_with_control_callback_matches_per_call_reference(
+    nthread: int, chunk_size: int | None
+) -> None:
+  model = _model()
+  nbatch = 4
+  nstep = 4
+  states = _batched_states(model, nbatch)
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=nthread) as pool:
+    # Reference: one step(nstep=1) call per substep, with control recomputed
+    # from the previously returned state, matching callback semantics.
+    expected = states.copy()
+    for _ in range(nstep):
+      control = _pd_control_from_state(expected, model)
+      expected = pool.step(expected, nstep=1, control=control, chunk_size=chunk_size)
+
+    calls: list[int] = []
+
+    def callback(step_index, state, sensordata):
+      del sensordata
+      calls.append(step_index)
+      return _pd_control_from_state(state, model)
+
+    got = pool.step(
+        states, nstep=nstep, control_callback=callback, chunk_size=chunk_size
+    )
+
+  assert calls == list(range(nstep))
+  np.testing.assert_allclose(got, expected, atol=1e-12, rtol=0)
+
+
+def test_step_control_callback_receives_initial_state_at_step_zero() -> None:
+  model = _model()
+  nbatch = 3
+  states = _batched_states(model, nbatch)
+  ncontrol = mj.mj_stateSize(model, mj.mjtState.mjSTATE_CTRL)
+  seen_states: list[np.ndarray] = []
+  seen_sensors: list[np.ndarray | None] = []
+
+  def callback(step_index, state, sensordata):
+    del step_index
+    seen_states.append(state.copy())
+    seen_sensors.append(None if sensordata is None else sensordata.copy())
+    return np.zeros((nbatch, ncontrol))
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=1) as pool:
+    pool.step(states, nstep=2, control_callback=callback)
+
+  assert len(seen_states) == 2
+  np.testing.assert_array_equal(seen_states[0], states)
+  # The pool has not re-evaluated sensors since the previous call, so
+  # callback(0) always receives None for sensordata.
+  assert seen_sensors[0] is None
+  assert seen_sensors[1] is not None
+
+
+def test_step_control_callback_call_count_and_indices() -> None:
+  model = _model()
+  nbatch = 2
+  nstep = 5
+  states = _batched_states(model, nbatch)
+  ncontrol = mj.mj_stateSize(model, mj.mjtState.mjSTATE_CTRL)
+  calls: list[int] = []
+
+  def callback(step_index, state, sensordata):
+    del state, sensordata
+    calls.append(step_index)
+    return np.zeros((nbatch, ncontrol))
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=2) as pool:
+    pool.step(states, nstep=nstep, control_callback=callback, chunk_size=1)
+
+  assert calls == list(range(nstep))
+
+
+def test_step_control_callback_sensordata_matches_per_call_reference() -> None:
+  model = _model()
+  nbatch = 3
+  nstep = 4
+  states = _batched_states(model, nbatch)
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=2) as pool:
+    expected_states = states.copy()
+    expected_sensors = []
+    for _ in range(nstep):
+      control = _pd_control_from_state(expected_states, model)
+      expected_states, sensor = pool.step(
+          expected_states,
+          nstep=1,
+          control=control,
+          chunk_size=2,
+          return_sensor=True,
+          post_step_forward_sensor=True,
+      )
+      expected_sensors.append(sensor)
+
+    seen_sensors: list[np.ndarray | None] = []
+
+    def callback(step_index, state, sensordata):
+      del step_index
+      seen_sensors.append(None if sensordata is None else sensordata.copy())
+      return _pd_control_from_state(state, model)
+
+    got_state, got_sensor = pool.step(
+        states,
+        nstep=nstep,
+        control_callback=callback,
+        chunk_size=2,
+        return_sensor=True,
+        post_step_forward_sensor=True,
+    )
+
+  np.testing.assert_allclose(got_state, expected_states, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(got_sensor, expected_sensors[-1], atol=1e-12, rtol=0)
+  # callback(0) always receives None; callback(t) for t >= 1 sees the
+  # refreshed sensordata of substep t - 1 (per-call reference call t).
+  assert seen_sensors[0] is None
+  for got_t, expected_t in zip(seen_sensors[1:], expected_sensors[:-1]):
+    np.testing.assert_allclose(got_t, expected_t, atol=1e-12, rtol=0)
+
+
+def test_step_control_callback_without_sensordata_matches_per_call_reference() -> None:
+  model = _model()
+  nbatch = 3
+  nstep = 4
+  states = _batched_states(model, nbatch)
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=2) as pool:
+    expected_states = states.copy()
+    expected_sensor = None
+    for _ in range(nstep):
+      control = _pd_control_from_state(expected_states, model)
+      expected_states, expected_sensor = pool.step(
+          expected_states,
+          nstep=1,
+          control=control,
+          chunk_size=2,
+          return_sensor=True,
+          post_step_forward_sensor=True,
+      )
+
+    seen_sensors: list[np.ndarray | None] = []
+
+    def callback(step_index, state, sensordata):
+      del step_index
+      seen_sensors.append(None if sensordata is None else sensordata.copy())
+      return _pd_control_from_state(state, model)
+
+    got_state, got_sensor = pool.step(
+        states,
+        nstep=nstep,
+        control_callback=callback,
+        callback_sensordata=False,
+        chunk_size=2,
+        return_sensor=True,
+        post_step_forward_sensor=True,
+    )
+
+  # With callback_sensordata=False every callback invocation gets None, but
+  # the final-step sensordata is still gathered and refreshed on return.
+  assert len(seen_sensors) == nstep
+  assert all(sensor is None for sensor in seen_sensors)
+  np.testing.assert_allclose(got_state, expected_states, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(got_sensor, expected_sensor, atol=1e-12, rtol=0)
+
+
+def test_step_control_callback_nstep1_without_sensordata_edge() -> None:
+  model = _model()
+  nbatch = 2
+  states = _batched_states(model, nbatch)
+  control = _pd_control_from_state(states, model)
+  seen_sensors: list[np.ndarray | None] = []
+
+  def callback(step_index, state, sensordata):
+    del step_index, state
+    seen_sensors.append(None if sensordata is None else sensordata.copy())
+    return control
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=2) as pool:
+    expected_state, expected_sensor = pool.step(
+        states,
+        nstep=1,
+        control=control,
+        chunk_size=1,
+        return_sensor=True,
+        post_step_forward_sensor=True,
+    )
+    got_state, got_sensor = pool.step(
+        states,
+        nstep=1,
+        control_callback=callback,
+        callback_sensordata=False,
+        chunk_size=1,
+        return_sensor=True,
+        post_step_forward_sensor=True,
+    )
+
+  assert seen_sensors == [None]
+  np.testing.assert_allclose(got_state, expected_state, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(got_sensor, expected_sensor, atol=1e-12, rtol=0)
+
+
+def test_step_control_callback_validation_errors() -> None:
+  model = _model()
+  nbatch = 2
+  states = _batched_states(model, nbatch)
+  ncontrol = mj.mj_stateSize(model, mj.mjtState.mjSTATE_CTRL)
+  good_control = np.zeros((nbatch, ncontrol))
+
+  with BatchEnvPool(model, nbatch=nbatch, nthread=0) as pool:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+      pool.step(
+          states,
+          nstep=1,
+          control=good_control,
+          control_callback=lambda t, s, d: good_control,
+      )
+    with pytest.raises(TypeError, match="callable"):
+      pool.step(states, nstep=1, control_callback=123)
+    with pytest.raises(ValueError, match="callback_sensordata"):
+      pool.step(states, nstep=1, callback_sensordata=False)
+    with pytest.raises(ValueError, match="float64"):
+      pool.step(
+          states,
+          nstep=1,
+          control_callback=lambda t, s, d: good_control.astype(np.float32),
+      )
+    with pytest.raises(ValueError, match="C-contiguous"):
+      pool.step(
+          states,
+          nstep=1,
+          control_callback=lambda t, s, d: np.zeros((nbatch, 2 * ncontrol))[:, ::2],
+      )
+    with pytest.raises(ValueError, match="shape"):
+      pool.step(
+          states,
+          nstep=1,
+          control_callback=lambda t, s, d: np.zeros((nbatch, ncontrol + 1)),
+      )
+    with pytest.raises(ValueError, match="numpy.ndarray"):
+      pool.step(states, nstep=1, control_callback=lambda t, s, d: [[0.0]])
+
+    class AbortRolloutError(Exception):
+      pass
+
+    def raising_callback(step_index, state, sensordata):
+      raise AbortRolloutError("abort rollout")
+
+    with pytest.raises(AbortRolloutError, match="abort rollout"):
+      pool.step(states, nstep=3, control_callback=raising_callback)
