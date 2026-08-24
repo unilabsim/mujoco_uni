@@ -39,7 +39,9 @@ PENDULUM_XML = """
 </mujoco>
 """
 
-_AVAILABLE_CPUS = sorted(os.sched_getaffinity(0))
+# Module-level guard: os.sched_getaffinity does not exist off Linux, and the
+# pytestmark skipif above only applies after collection evaluates this line.
+_AVAILABLE_CPUS = sorted(os.sched_getaffinity(0)) if sys.platform == "linux" else []
 _TWO_CPUS_REQUIRED = pytest.mark.skipif(
     len(_AVAILABLE_CPUS) < 2, reason="test needs at least 2 available CPUs"
 )
