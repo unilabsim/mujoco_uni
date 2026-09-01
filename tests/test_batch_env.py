@@ -106,3 +106,36 @@ def test_step_exposes_per_env_autoreset_mask() -> None:
 
         pool.step(state, nstep=3, control=np.zeros_like(control))
         assert not pool.was_autoreset.any()
+
+
+def test_step_control_callback_exposes_per_env_autoreset_mask() -> None:
+    import numpy as np
+
+    from mujoco_uni.batch_env import BatchEnvPool
+
+    model = mujoco.MjModel.from_xml_string(_BLOWUP_XML)
+    nbatch = 4
+    ncontrol = mujoco.mj_stateSize(model, mujoco.mjtState.mjSTATE_CTRL)
+    for nthread in (0, 2):
+      with BatchEnvPool(model, nbatch=nbatch, nthread=nthread) as pool:
+        state = np.zeros((nbatch, pool.nstate), dtype=np.float64)
+        state[:, 1] = 0.1
+
+        def callback(step_index, state, sensordata):
+          del state, sensordata
+          control = np.zeros((nbatch, ncontrol), dtype=np.float64)
+          if step_index == 1:
+            # Diverge env 2 in a middle round: the mask must stick until the
+            # end of the step call even though later rounds run clean.
+            control[2, 0] = 1e9
+          return control
+
+        pool.step(state, nstep=3, control_callback=callback)
+        assert pool.was_autoreset.tolist() == [False, False, True, False]
+
+        def clean(step_index, state, sensordata):
+          del step_index, state, sensordata
+          return np.zeros((nbatch, ncontrol), dtype=np.float64)
+
+        pool.step(state, nstep=3, control_callback=clean)
+        assert not pool.was_autoreset.any()

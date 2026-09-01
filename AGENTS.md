@@ -131,6 +131,10 @@ Critical build facts:
 - Import-time fail-fast checks (`runtime/batch.py`): loaded `mujoco` must be in range,
   must expose `mujoco.MjModel._address` and `mujoco.MjModel._from_model_ptr`, and must
   exactly match the native extension's recorded build version.
+- Maintenance: when a new MuJoCo version enters the supported range, re-audit the
+  mixed-model `mjData` allocation-envelope field list
+  (`ModelDataEnvelopeDominates` in `native/batch_env.cc`) against that version's
+  `mj_makeData` buffer/arena partitioning (see the comment above the function).
 
 ## Testing Instructions
 

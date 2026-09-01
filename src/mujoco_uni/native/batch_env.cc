@@ -439,6 +439,12 @@ std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
 // safe only when the allocation model is at least as large in every dimension.
 // Aggregate nbuffer alone is insufficient: a deficit in one array can
 // overwrite the following array even if another array is larger.
+//
+// Maintenance: the field list below must be audited against mj_makeData's
+// buffer/arena partitioning (engine_io.c: MJDATA_POINTERS and the arena
+// sizing inputs) whenever a new MuJoCo version enters the supported range;
+// any new layout-relevant mjModel field must be added here. The nJten guard
+// is an example: tendon sparsity counts only exist on newer MuJoCo versions.
 bool ModelDataEnvelopeDominates(const raw::MjModel* candidate,
                                 const raw::MjModel* model) {
 #define MJ_MODEL_FIELD_GE(name) \

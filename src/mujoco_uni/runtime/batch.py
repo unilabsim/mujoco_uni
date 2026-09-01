@@ -258,7 +258,13 @@ class BatchEnvPool:
 
   @property
   def was_autoreset(self) -> np.ndarray:
-    """Boolean mask for environments autoreset during the last step call."""
+    """Boolean mask for environments autoreset during the last step call.
+
+    The mask is derived from MuJoCo's BADQPOS/BADQVEL/BADQACC warnings. A
+    model that disables autoreset (``<flag autoreset="disable"/>``) still
+    raises these warnings without resetting its ``mjData``, so in that case
+    the mask means "divergence warning raised" rather than an actual reset.
+    """
     if self._pool is None:
       raise RuntimeError("was_autoreset requested after pool close")
     return np.asarray(self._pool.was_autoreset, dtype=np.bool_)
