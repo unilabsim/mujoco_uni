@@ -193,6 +193,62 @@ Critical build facts:
 - No secrets are stored in the repo; PyPI publishing uses GitHub trusted publishing
   (OIDC), no API tokens.
 
+## GitHub CLI (gh) Cheat Sheet
+
+Remote: `github.com/unilabsim/mujoco_uni` (SSH). Authenticated via `gh`.
+
+### Issues
+
+```bash
+gh issue list
+gh issue view <number>
+gh api repos/unilabsim/mujoco_uni/issues/<number> --jq '.title, .body'
+```
+
+### Discussions
+
+Discussions are enabled on the repo. `gh` has no native discussion subcommand;
+use GraphQL:
+
+```bash
+# List categories (needed once for the category id)
+gh api graphql -f query='query { repository(owner:"unilabsim", name:"mujoco_uni") {
+  discussionCategories(first:20) { nodes { id name } } } }'
+
+# Create a discussion (body from a file)
+jq -n --rawfile body <file.md> '{query: "mutation($repo: ID!, $cat: ID!, $title: String!,
+  $body: String!) { createDiscussion(input: {repositoryId: $repo, categoryId: $cat,
+  title: $title, body: $body}) { discussion { url number } } }",
+  variables: {repo: "<repo-id>", cat: "<category-id>", title: "<title>", body: $body}}' \
+  | gh api graphql --input -
+```
+
+### Pull requests
+
+```bash
+gh pr create --title "<title>" --body "<body>" --base main
+gh pr list
+gh pr view
+```
+
+PR gate before creating or updating a PR:
+
+1. The final commit is done and `git status --short --branch` shows a clean tree.
+2. The final head passes the local gate `make check` (ruff + pytest); record the
+   result in the PR body.
+3. The remote release workflow (`.github/workflows/release.yml`) runs only on
+   `v*` tags and manual dispatch, so PRs are gated by the local checks plus
+   review, not by remote CI.
+
+### CI workflow runs
+
+```bash
+gh run list
+gh run list --workflow=release.yml
+gh run view <run-id>
+gh run list --status=failure
+```
+
 ## Release Process
 
 - CI/release: `.github/workflows/release.yml`, triggered by `v*` tags or manual
