@@ -78,10 +78,10 @@ GPU side
 
 MuJoCoUni 拥有自己的包版本，独立于 MuJoCo 求解器版本。
 
-当前发布版本：
+当前开发版本（基于 0.4.0 发布版）：
 
 ```text
-mujoco-uni-runtime==0.4.0
+mujoco-uni-runtime==0.4.1.dev0
 mujoco>=3.5,<3.11
 ```
 
@@ -240,7 +240,7 @@ uv 项目以声明式达到同样效果：
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.1.dev0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]

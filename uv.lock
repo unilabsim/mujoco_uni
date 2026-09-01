@@ -176,7 +176,7 @@ wheels = [
 
 [[package]]
 name = "mujoco-uni-runtime"
-version = "0.4.0"
+version = "0.4.1.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "mujoco" },

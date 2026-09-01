@@ -81,10 +81,10 @@ GPU side
 
 MuJoCoUni has its own package version, independent of the MuJoCo solver version.
 
-Current release:
+Current development version (based on the 0.4.0 release):
 
 ```text
-mujoco-uni-runtime==0.4.0
+mujoco-uni-runtime==0.4.1.dev0
 mujoco>=3.5,<3.11
 ```
 
@@ -283,7 +283,7 @@ uv projects declare the same setup:
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.1.dev0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]

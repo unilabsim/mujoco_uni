@@ -1508,7 +1508,8 @@ class BatchEnvPool {
       }
     }
     if (allocation_model == nullptr) {
-      throw py::value_error("internal error selecting mjData allocation envelope");
+      throw py::value_error(
+          "internal error selecting mjData allocation envelope");
     }
 
     int ndata = nthread_ > 0 ? nthread_ : 1;

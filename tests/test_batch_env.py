@@ -17,7 +17,7 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 def test_package_version_is_independent_from_solver_version() -> None:
     assert importlib.metadata.version("mujoco-uni-runtime") == mujoco_uni.__version__
-    assert mujoco_uni.__version__ == "0.4.0"
+    assert mujoco_uni.__version__ == "0.4.1.dev0"
     assert mujoco_uni.MUJOCO_DEFAULT_VERSION == "3.8.0"
     assert mujoco_uni.MUJOCO_MIN_VERSION == "3.5.0"
     assert mujoco_uni.MUJOCO_MAX_VERSION_EXCLUSIVE == "3.11.0"
