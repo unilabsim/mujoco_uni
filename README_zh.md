@@ -129,10 +129,6 @@ MuJoCoUni 负责 UniLab 所使用的内部发现（discovery）与进程派生�
 
 MuJoCo Python 模型指针所需的辅助函数 `_address` 和 `_from_model_ptr` 会在导入时进行检查。
 
-## 路线图
-
-后续开发在 [ROADMAP.md](ROADMAP.md) 中跟踪。
-
 ## 包结构
 
 其结构参照 DrakeUni 的运行时代码、原生源码与编译产物之间的划分：
@@ -258,6 +254,16 @@ uv sync
 uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 ```
 
+常用开发命令也已封装在 `Makefile` 中：
+
+```bash
+make sync       # uv sync
+make install    # editable 安装（编译原生扩展）
+make check      # ruff + pytest
+make test       # 仅运行 pytest
+make matrix     # 跨受支持 MuJoCo 版本的版本矩阵检查
+```
+
 UniLab 通过其兼容/后端层导入，该层进而导入：
 
 ```python
@@ -294,11 +300,17 @@ uv run ruff check .
 uv run pytest -q
 ```
 
+或直接运行 `make check`。使用 `make mujoco MJ=<版本>` 切换 MuJoCo 版本后，
+请用 `make test-no-sync` 运行测试，以保留刚构建的原生目标。
+
 版本矩阵（version matrix）检查：
 
 ```bash
 uv run python tools/version_matrix.py --pytest
 ```
+
+或 `make matrix`。完整的 UniLab 验证可通过 `make test-unilab` 和
+`make test-unilab-train` 运行。
 
 默认矩阵覆盖：
 

@@ -1,1 +1,0 @@
-recursive-include src/mujoco_uni/native *.cc *.h

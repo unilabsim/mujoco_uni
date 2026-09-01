@@ -146,10 +146,6 @@ training launch path.
 The required MuJoCo Python model pointer helpers, `_address` and
 `_from_model_ptr`, are checked at import time.
 
-## Roadmap
-
-Further development is tracked in [ROADMAP.md](ROADMAP.md).
-
 ## Package Layout
 
 The structure mirrors the DrakeUni split between runtime code, native source,
@@ -301,6 +297,16 @@ uv sync
 uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 ```
 
+The common development commands are also wrapped in the `Makefile`:
+
+```bash
+make sync       # uv sync
+make install    # editable install (builds the native extension)
+make check      # ruff + pytest
+make test       # pytest only
+make matrix     # version-matrix checks across supported MuJoCo versions
+```
+
 UniLab imports through its compatibility/backend layer, which in turn imports:
 
 ```python
@@ -341,11 +347,18 @@ uv run ruff check .
 uv run pytest -q
 ```
 
+or simply `make check`. After switching the MuJoCo version with
+`make mujoco MJ=<version>`, run tests with `make test-no-sync` so the freshly
+built native target is preserved.
+
 Version-matrix checks:
 
 ```bash
 uv run python tools/version_matrix.py --pytest
 ```
+
+or `make matrix`. Full UniLab validation is available as `make test-unilab` and
+`make test-unilab-train`.
 
 The default matrix covers:
 
