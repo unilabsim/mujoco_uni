@@ -48,6 +48,64 @@ HFIELD_XML = """
 """
 
 
+def _layout_variant_model(*, dominant: bool) -> mujoco.MjModel:
+  object_geoms = """
+      <geom type="box" size="0.06 0.04 0.03" pos="-0.08 0 0" mass="0.7"/>
+      <geom type="box" size="0.03 0.025 0.02" pos="0.12 0 0" mass="0.3"/>
+  """ if dominant else """
+      <geom type="box" size="0.06 0.04 0.03" mass="1"/>
+  """
+  return mj.MjModel.from_xml_string(
+      f"""
+      <mujoco>
+        <option timestep="0.002" gravity="0 0 -9.81"/>
+        <worldbody>
+          <geom type="plane" size="1 1 0.1"/>
+          <body name="object" pos="0 0 0.3">
+            <freejoint/>
+            {object_geoms}
+            <site name="object_site"/>
+          </body>
+        </worldbody>
+        <sensor><framepos objtype="site" objname="object_site"/></sensor>
+      </mujoco>
+      """
+  )
+
+
+def _crossed_layout_models() -> tuple[mujoco.MjModel, mujoco.MjModel]:
+  high_nc = mj.MjModel.from_xml_string(
+      """
+      <mujoco>
+        <worldbody>
+          <body name="object">
+            <freejoint/>
+            <inertial pos="0.02 0.01 0.03" mass="1" diaginertia="0.01 0.02 0.03"/>
+            <geom type="box" size="0.05 0.04 0.03"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+  )
+  high_bvh = mj.MjModel.from_xml_string(
+      """
+      <mujoco>
+        <worldbody>
+          <geom type="box" size="0.1 0.1 0.01" pos="-0.6 0 0"/>
+          <geom type="box" size="0.1 0.1 0.01" pos="-0.3 0 0"/>
+          <geom type="box" size="0.1 0.1 0.01" pos="0.3 0 0"/>
+          <geom type="box" size="0.1 0.1 0.01" pos="0.6 0 0"/>
+          <body name="object">
+            <freejoint/>
+            <geom type="box" size="0.05 0.04 0.03" mass="1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+  )
+  return high_nc, high_bvh
+
+
 def _model(xml: str = PENDULUM_XML) -> mujoco.MjModel:
   return mj.MjModel.from_xml_string(xml)
 
@@ -191,6 +249,50 @@ def test_constructor_accepts_single_model_and_model_sequences() -> None:
     BatchEnvPool(model, nbatch=1, nthread=-1)
   with pytest.raises(ValueError):
     BatchEnvPool([model, model], nbatch=3, nthread=0)
+
+
+@pytest.mark.parametrize("nthread", [0, 2])
+def test_dominant_data_layout_model_supports_mixed_nc_serial_parity(nthread: int) -> None:
+  small = _layout_variant_model(dominant=False)
+  dominant = _layout_variant_model(dominant=True)
+  assert dominant.ngeom > small.ngeom
+  assert dominant.nbvh > small.nbvh
+  assert dominant.nC > small.nC
+  assert dominant.nbuffer > small.nbuffer
+
+  models = [small, dominant]
+  states = np.asarray([
+      _state_from_qpos_qvel(model, model.qpos0,
+                             np.full(model.nv, 0.01 * (i + 1)))
+      for i, model in enumerate(models)
+  ])
+  with BatchEnvPool(models, nbatch=2, nthread=nthread) as pool:
+    got_step = pool.step(states, nstep=3, chunk_size=1)
+    got_forward = pool.forward(states, chunk_size=1)
+    reset_state, reset_sensor = pool.reset([0, 1], states, chunk_size=1)
+
+  expected_step = np.concatenate([
+      _serial_step(model, states[i : i + 1], nstep=3)[0]
+      for i, model in enumerate(models)
+  ])
+  expected_forward = np.concatenate([
+      _serial_forward(model, states[i : i + 1])
+      for i, model in enumerate(models)
+  ])
+  np.testing.assert_allclose(got_step, expected_step, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(got_forward, expected_forward, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(reset_state, states, atol=1e-12, rtol=0)
+  np.testing.assert_allclose(reset_sensor, expected_forward, atol=1e-12, rtol=0)
+
+
+def test_crossed_data_layout_requirements_fail_closed() -> None:
+  high_nc, high_bvh = _crossed_layout_models()
+  assert high_nc.nC > high_bvh.nC
+  assert high_nc.ngeom < high_bvh.ngeom
+  assert high_nc.nbvh < high_bvh.nbvh
+
+  with pytest.raises(ValueError, match="safe mjData allocation envelope"):
+    BatchEnvPool([high_nc, high_bvh], nbatch=2, nthread=0)
 
 
 @pytest.mark.parametrize("nthread,chunk_size", [(0, None), (1, None), (2, 1), (2, 5)])

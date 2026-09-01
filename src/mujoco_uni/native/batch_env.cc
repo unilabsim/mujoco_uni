@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -65,6 +66,15 @@ namespace raw {
 using MjModel = ::mjModel;
 using MjData = ::mjData;
 }  // namespace raw
+
+constexpr int32_t kNoWarning = -1;
+
+int32_t FirstRaisedWarning(const raw::MjData* d) {
+  for (int i = 0; i < mjNWARNING; ++i) {
+    if (d->warning[i].number) return static_cast<int32_t>(i);
+  }
+  return kNoWarning;
+}
 
 template <typename Func>
 Func InterceptMjErrors(Func func) {
@@ -330,7 +340,7 @@ const raw::MjModel* CastMjModelOrThrow(
   }
 }
 
-bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
+bool SameModelStateLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
   if (mj_stateSize(lhs, mjSTATE_FULLPHYSICS) !=
       mj_stateSize(rhs, mjSTATE_FULLPHYSICS)) {
     return false;
@@ -347,7 +357,7 @@ bool SameModelDataLayout(const raw::MjModel* lhs, const raw::MjModel* rhs) {
   MJ_MODEL_FIELD_EQ(nbvhdynamic);
   MJ_MODEL_FIELD_EQ(njnt);
   MJ_MODEL_FIELD_EQ(nM);
-  MJ_MODEL_FIELD_EQ(nC);
+  // nC may vary with body_simple; the allocation envelope handles it below.
   MJ_MODEL_FIELD_EQ(nD);
   // MJ_MODEL_FIELD_EQ(ngeom);  // relaxed: one object has fewer geoms
   MJ_MODEL_FIELD_EQ(nsite);
@@ -411,7 +421,7 @@ std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
   }
 
   for (py::ssize_t i = 1; i < nmodel; ++i) {
-    if (!SameModelDataLayout(models[0], models[i])) {
+    if (!SameModelStateLayout(models[0], models[i])) {
       std::ostringstream msg;
       msg << "models are not compatible: model[0] and model[" << i << "]";
       throw py::value_error(msg.str());
@@ -422,6 +432,73 @@ std::vector<const raw::MjModel*> NormalizeModelsOrThrow(py::object model_obj,
     models.resize(nbatch, models[0]);
   }
   return models;
+}
+
+// mjData's main buffer is partitioned into independently addressed arrays whose
+// lengths come from mjModel. Reusing data allocated for a different model is
+// safe only when the allocation model is at least as large in every dimension.
+// Aggregate nbuffer alone is insufficient: a deficit in one array can
+// overwrite the following array even if another array is larger.
+bool ModelDataEnvelopeDominates(const raw::MjModel* candidate,
+                                const raw::MjModel* model) {
+#define MJ_MODEL_FIELD_GE(name) \
+  if (candidate->name < model->name) return false
+  MJ_MODEL_FIELD_GE(nq);
+  MJ_MODEL_FIELD_GE(nv);
+  MJ_MODEL_FIELD_GE(na);
+  MJ_MODEL_FIELD_GE(nhistory);
+  MJ_MODEL_FIELD_GE(npluginstate);
+  MJ_MODEL_FIELD_GE(nu);
+  MJ_MODEL_FIELD_GE(nbody);
+  MJ_MODEL_FIELD_GE(neq);
+  MJ_MODEL_FIELD_GE(nmocap);
+  MJ_MODEL_FIELD_GE(nuserdata);
+  MJ_MODEL_FIELD_GE(nsensordata);
+  MJ_MODEL_FIELD_GE(ntree);
+  MJ_MODEL_FIELD_GE(nplugin);
+  MJ_MODEL_FIELD_GE(njnt);
+  MJ_MODEL_FIELD_GE(ngeom);
+  MJ_MODEL_FIELD_GE(nsite);
+  MJ_MODEL_FIELD_GE(ncam);
+  MJ_MODEL_FIELD_GE(nlight);
+  MJ_MODEL_FIELD_GE(nflexvert);
+  MJ_MODEL_FIELD_GE(nflexedge);
+  MJ_MODEL_FIELD_GE(nflexelem);
+  MJ_MODEL_FIELD_GE(nJfe);
+  MJ_MODEL_FIELD_GE(nJfv);
+  MJ_MODEL_FIELD_GE(nbvhdynamic);
+  MJ_MODEL_FIELD_GE(ntendon);
+#if MUJOCO_UNI_HAS_TENDON_SPARSITY_COUNT
+  MJ_MODEL_FIELD_GE(nJten);
+#endif
+  MJ_MODEL_FIELD_GE(nwrap);
+  MJ_MODEL_FIELD_GE(nJmom);
+  MJ_MODEL_FIELD_GE(nM);
+  MJ_MODEL_FIELD_GE(nC);
+  MJ_MODEL_FIELD_GE(nbvh);
+  MJ_MODEL_FIELD_GE(nD);
+  MJ_MODEL_FIELD_GE(narena);
+  MJ_MODEL_FIELD_GE(nbuffer);
+#undef MJ_MODEL_FIELD_GE
+
+  return true;
+}
+
+const raw::MjModel* SelectDataAllocationModelOrThrow(
+    const std::vector<const raw::MjModel*>& models) {
+  for (const raw::MjModel* candidate : models) {
+    bool dominates_all = true;
+    for (const raw::MjModel* model : models) {
+      if (!ModelDataEnvelopeDominates(candidate, model)) {
+        dominates_all = false;
+        break;
+      }
+    }
+    if (dominates_all) return candidate;
+  }
+  throw py::value_error(
+      "models are compatible in state semantics, but no model provides a "
+      "safe mjData allocation envelope");
 }
 
 std::string SupportedFieldsString() {
@@ -587,7 +664,8 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
                   unsigned int control_spec, const mjtNum* state0,
                   const mjtNum* warmstart0, const mjtNum* control,
                   mjtNum* state_out, mjtNum* sensordata_out,
-                  bool post_step_forward_sensor, bool control_is_constant) {
+                  bool post_step_forward_sensor, bool control_is_constant,
+                  int32_t* warning_out) {
   size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
   size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
   size_t nv = static_cast<size_t>(m[0]->nv);
@@ -655,6 +733,8 @@ void _unsafe_step(const std::vector<const raw::MjModel*>& m, raw::MjData* d,
       mj_step(m[r], d);
     }
 
+    if (warning_out) warning_out[r] = FirstRaisedWarning(d);
+
     // Write only the final state for this env.
     mj_getState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
     if (sensordata_out) {
@@ -690,7 +770,8 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
                            const mjtNum* warmstart0, const mjtNum* control,
                            mjtNum* state_out, mjtNum* sensordata_out,
                            bool post_step_forward_sensor, ThreadPool* pool,
-                           int chunk_size, bool control_is_constant) {
+                           int chunk_size, bool control_is_constant,
+                           int32_t* warning_out) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -703,7 +784,7 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
       _unsafe_step(m, d[id], j * chunk_size, (j + 1) * chunk_size, nstep,
                    control_spec, state0, warmstart0, control, state_out,
                    sensordata_out, post_step_forward_sensor,
-                   control_is_constant);
+                   control_is_constant, warning_out);
     };
     pool->Schedule(task);
   }
@@ -713,7 +794,7 @@ void _unsafe_step_threaded(const std::vector<const raw::MjModel*>& m,
                    nfulljobs * chunk_size + chunk_remainder, nstep,
                    control_spec, state0, warmstart0, control, state_out,
                    sensordata_out, post_step_forward_sensor,
-                   control_is_constant);
+                   control_is_constant, warning_out);
     };
     pool->Schedule(task);
   }
@@ -739,7 +820,8 @@ void _unsafe_step_callback_round(const std::vector<const raw::MjModel*>& m,
                                  const mjtNum* state0, const mjtNum* warmstart0,
                                  const mjtNum* control, bool init,
                                  mjtNum* state_out, mjtNum* sensordata_out,
-                                 bool post_step_forward_sensor) {
+                                 bool post_step_forward_sensor,
+                                 int32_t* warning_out) {
   size_t nstate = static_cast<size_t>(mj_stateSize(m[0], mjSTATE_FULLPHYSICS));
   size_t ncontrol = static_cast<size_t>(mj_stateSize(m[0], control_spec));
   size_t nv = static_cast<size_t>(m[0]->nv);
@@ -807,6 +889,11 @@ void _unsafe_step_callback_round(const std::vector<const raw::MjModel*>& m,
     }
     mj_step(m[r], d);
 
+    int32_t warning = FirstRaisedWarning(d);
+    if (warning_out && warning_out[r] == kNoWarning && warning != kNoWarning) {
+      warning_out[r] = warning;
+    }
+
     mj_getState(m[r], d, state_out + r * nstate, mjSTATE_FULLPHYSICS);
     if (sensordata_out) {
       if (post_step_forward_sensor) {
@@ -840,7 +927,7 @@ void _unsafe_step_callback_round_threaded(
     int nbatch, unsigned int control_spec, const mjtNum* state0,
     const mjtNum* warmstart0, const mjtNum* control, bool init,
     mjtNum* state_out, mjtNum* sensordata_out, bool post_step_forward_sensor,
-    ThreadPool* pool, int chunk_size) {
+    ThreadPool* pool, int chunk_size, int32_t* warning_out) {
   int nfulljobs = nbatch / chunk_size;
   int chunk_remainder = nbatch % chunk_size;
   int njobs = (chunk_remainder > 0) ? nfulljobs + 1 : nfulljobs;
@@ -853,7 +940,8 @@ void _unsafe_step_callback_round_threaded(
       _unsafe_step_callback_round(m, d[id], j * chunk_size,
                                   (j + 1) * chunk_size, control_spec, state0,
                                   warmstart0, control, init, state_out,
-                                  sensordata_out, post_step_forward_sensor);
+                                  sensordata_out, post_step_forward_sensor,
+                                  warning_out);
     };
     pool->Schedule(task);
   }
@@ -863,7 +951,7 @@ void _unsafe_step_callback_round_threaded(
           m, d[pool->WorkerId()], nfulljobs * chunk_size,
           nfulljobs * chunk_size + chunk_remainder, control_spec, state0,
           warmstart0, control, init, state_out, sensordata_out,
-          post_step_forward_sensor);
+          post_step_forward_sensor, warning_out);
     };
     pool->Schedule(task);
   }
@@ -1377,6 +1465,8 @@ class BatchEnvPool {
 
     std::vector<const raw::MjModel*> src_models =
         NormalizeModelsOrThrow(model_obj, nbatch_);
+    const raw::MjModel* allocation_src_model =
+        SelectDataAllocationModelOrThrow(src_models);
 
     // Deduplicate: identical source pointers share one copy.
     // This avoids 3200 mj_copyModel calls when 32 unique models are
@@ -1409,20 +1499,22 @@ class BatchEnvPool {
       ++model_refcounts_[m];
     }
 
-    // Find the model with the largest nbvh to ensure MjData is big enough
-    // for all model variants (different mesh topologies → different nbvh).
-    // mjData.bvh_active has size nbvh, so we need the largest one.
-    const raw::MjModel* largest_model = models_[0];
-    for (int i = 1; i < nbatch_; ++i) {
-      if (models_[i]->nbvh > largest_model->nbvh) {
-        largest_model = models_[i];
+    // Map the selected source envelope to the corresponding owned copy.
+    const raw::MjModel* allocation_model = nullptr;
+    for (int i = 0; i < nbatch_; ++i) {
+      if (src_models[i] == allocation_src_model) {
+        allocation_model = models_[i];
+        break;
       }
+    }
+    if (allocation_model == nullptr) {
+      throw py::value_error("internal error selecting mjData allocation envelope");
     }
 
     int ndata = nthread_ > 0 ? nthread_ : 1;
     worker_data_.resize(ndata, nullptr);
     for (int t = 0; t < ndata; ++t) {
-      worker_data_[t] = mj_makeData(largest_model);
+      worker_data_[t] = mj_makeData(allocation_model);
       if (worker_data_[t] == nullptr) {
         for (int j = 0; j < t; ++j) {
           mj_deleteData(worker_data_[j]);
@@ -1452,6 +1544,7 @@ class BatchEnvPool {
     nstate_ = mj_stateSize(models_[0], mjSTATE_FULLPHYSICS);
     nv_ = models_[0]->nv;
     nsensordata_ = models_[0]->nsensordata;
+    last_step_warning_.assign(nbatch_, kNoWarning);
   }
 
   ~BatchEnvPool() {
@@ -1585,6 +1678,7 @@ class BatchEnvPool {
 
     std::vector<const raw::MjModel*> cmodels(nbatch_);
     for (int i = 0; i < nbatch_; ++i) cmodels[i] = models_[i];
+    std::fill(last_step_warning_.begin(), last_step_warning_.end(), kNoWarning);
 
     {
       py::gil_scoped_release no_gil;
@@ -1596,12 +1690,13 @@ class BatchEnvPool {
             cmodels, worker_data_, nbatch_, nstep, control_spec, state0_ptr,
             warmstart0_ptr, control_ptr, state_ptr, sensordata_ptr,
             post_step_forward_sensor, pool_.get(), chunk,
-            control_is_constant);
+            control_is_constant, last_step_warning_.data());
       } else {
         InterceptMjErrors(_unsafe_step)(
             cmodels, worker_data_[0], 0, nbatch_, nstep, control_spec,
             state0_ptr, warmstart0_ptr, control_ptr, state_ptr,
-            sensordata_ptr, post_step_forward_sensor, control_is_constant);
+            sensordata_ptr, post_step_forward_sensor, control_is_constant,
+            last_step_warning_.data());
       }
     }
 
@@ -1967,6 +2062,17 @@ class BatchEnvPool {
   int nv() const { return nv_; }
   int nsensordata() const { return nsensordata_; }
 
+  py::array_t<bool> was_autoreset() const {
+    py::array_t<bool> out(nbatch_);
+    bool* ptr = static_cast<bool*>(out.request().ptr);
+    for (int i = 0; i < nbatch_; ++i) {
+      int32_t warning = last_step_warning_[i];
+      ptr[i] = warning == mjWARN_BADQPOS || warning == mjWARN_BADQVEL ||
+               warning == mjWARN_BADQACC;
+    }
+    return out;
+  }
+
   // Configured worker→CPU mapping (empty when no affinity was requested).
   const std::vector<int>& cpu_ids() const { return cpu_ids_; }
 
@@ -2124,6 +2230,7 @@ class BatchEnvPool {
 
     std::vector<const raw::MjModel*> cmodels(nbatch_);
     for (int i = 0; i < nbatch_; ++i) cmodels[i] = models_[i];
+    std::fill(last_step_warning_.begin(), last_step_warning_.end(), kNoWarning);
 
     int chunk = 0;
     if (nthread_ > 0 && nbatch_ > 1) {
@@ -2151,12 +2258,13 @@ class BatchEnvPool {
               cmodels, worker_data_, nbatch_, control_spec, state0_ptr,
               warmstart0_ptr, control_ptr, init, state_ptr,
               round_sensordata_ptr, post_step_forward_sensor, pool_.get(),
-              chunk);
+              chunk, last_step_warning_.data());
         } else {
           InterceptMjErrors(_unsafe_step_callback_round)(
               cmodels, worker_data_[0], 0, nbatch_, control_spec, state0_ptr,
               warmstart0_ptr, control_ptr, init, state_ptr,
-              round_sensordata_ptr, post_step_forward_sensor);
+              round_sensordata_ptr, post_step_forward_sensor,
+              last_step_warning_.data());
         }
       }
       if (last) break;
@@ -2182,6 +2290,7 @@ class BatchEnvPool {
   int nstate_ = 0;
   int nv_ = 0;
   int nsensordata_ = 0;
+  std::vector<int32_t> last_step_warning_;
   std::vector<int> cpu_ids_;               // worker i → CPU id (empty = no pinning)
   std::vector<raw::MjModel*> models_;        // per-env model pointers (may alias)
   std::vector<raw::MjModel*> owned_models_;  // unique copies we own (for cleanup)
@@ -2243,6 +2352,7 @@ PYBIND11_MODULE(_batch_env, pymodule) {
       .def_property_readonly("nstate", &BatchEnvPool::nstate)
       .def_property_readonly("nv", &BatchEnvPool::nv)
       .def_property_readonly("nsensordata", &BatchEnvPool::nsensordata)
+      .def_property_readonly("was_autoreset", &BatchEnvPool::was_autoreset)
       .def_property_readonly("cpu_ids", &BatchEnvPool::cpu_ids)
       .def("worker_cpu_ids", &BatchEnvPool::worker_cpu_ids);
 
