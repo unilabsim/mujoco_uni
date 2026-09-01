@@ -67,3 +67,42 @@ def test_batch_env_constructs_from_official_mujoco_model() -> None:
         assert pool.nthread == 1
         assert pool.nstate == mj.mj_stateSize(model, mj.mjtState.mjSTATE_FULLPHYSICS)
         assert pool.get_model(0).nbody == model.nbody
+
+
+_BLOWUP_XML = """
+<mujoco>
+  <option timestep="0.01"/>
+  <worldbody>
+    <body name="arm">
+      <joint name="j0" type="hinge" axis="0 0 1"/>
+      <geom type="capsule" size="0.005 0.05" fromto="0 0 0 0.1 0 0" mass="1e-6"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="m0" joint="j0" gear="1e9" ctrlrange="-1e9 1e9"/>
+  </actuator>
+</mujoco>
+"""
+
+
+def test_step_exposes_per_env_autoreset_mask() -> None:
+    import numpy as np
+
+    from mujoco_uni.batch_env import BatchEnvPool
+
+    model = mujoco.MjModel.from_xml_string(_BLOWUP_XML)
+    for nthread in (0, 2):
+      with BatchEnvPool(model, nbatch=4, nthread=nthread) as pool:
+        state = np.zeros((4, pool.nstate), dtype=np.float64)
+        state[:, 1] = 0.1
+        control = np.zeros((4, model.nu), dtype=np.float64)
+        control[2, 0] = 1e9
+
+        assert pool.was_autoreset.dtype == np.bool_
+        assert not pool.was_autoreset.any()
+        out = pool.step(state, nstep=3, control=control)
+        assert pool.was_autoreset.tolist() == [False, False, True, False]
+        assert out[2, 1] == 0.0
+
+        pool.step(state, nstep=3, control=np.zeros_like(control))
+        assert not pool.was_autoreset.any()

@@ -257,6 +257,13 @@ class BatchEnvPool:
     return self._pool.nsensordata
 
   @property
+  def was_autoreset(self) -> np.ndarray:
+    """Boolean mask for environments autoreset during the last step call."""
+    if self._pool is None:
+      raise RuntimeError("was_autoreset requested after pool close")
+    return np.asarray(self._pool.was_autoreset, dtype=np.bool_)
+
+  @property
   def cpu_ids(self) -> Optional[tuple[int, ...]]:
     """Configured worker→CPU mapping, or ``None`` when affinity is unset."""
     if self._pool is None:
