@@ -84,7 +84,7 @@ MuJoCoUni has its own package version, independent of the MuJoCo solver version.
 Current release:
 
 ```text
-mujoco-uni-runtime==0.4.0
+mujoco-uni-runtime==0.5.0
 mujoco>=3.5,<3.12
 ```
 
@@ -255,19 +255,30 @@ Returned model views remain valid only while the pool is alive.
 
 ## Installation
 
-MuJoCoUni is published as `mujoco-uni-runtime` (**source distribution only**):
+MuJoCoUni is published as `mujoco-uni-runtime`. The default install path is a
+**prebuilt wheel** bound to the default MuJoCo version (`3.11.0`), published
+for linux x86_64 / aarch64 and macOS arm64 × Python 3.10–3.13:
+
+```bash
+pip install "mujoco==3.11.0" mujoco-uni-runtime
+```
+
+One released runtime version carries exactly one MuJoCo binding (PyPI filename
+identity), and the native extension refuses to load against any MuJoCo version
+other than its build-time one (exact-version watchdog at import time).
+
+For any **non-default MuJoCo version**, the **sdist** is the fallback and the
+only path: build from source against your environment's `mujoco` with
+`--no-build-isolation` (so the build does not see a throwaway isolated
+environment). Windows users take this path as well — no Windows wheels.
 
 ```bash
 pip install "mujoco>=3.5,<3.12" pybind11 numpy setuptools wheel
-pip install mujoco-uni-runtime --no-build-isolation
+pip install mujoco-uni-runtime --no-binary mujoco-uni-runtime --no-build-isolation
 ```
 
-There are no prebuilt wheels on purpose: the native extension is compiled
-against the `mujoco` package present at build time and refuses to load against
-any other MuJoCo version, so a prebuilt wheel would silently bind you to one
-MuJoCo release. Install with `--no-build-isolation` (as above) so the
-extension is compiled against the `mujoco` version of your target environment
-instead of a throwaway isolated one.
+See [docs/release-coordination.md](docs/release-coordination.md) for the
+cross-repo release coordination rules.
 
 ### Prerequisites
 
@@ -284,7 +295,7 @@ uv projects declare the same setup:
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.12", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco~=3.11.0", "mujoco-uni-runtime==0.5.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]

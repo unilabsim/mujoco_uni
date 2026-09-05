@@ -8,6 +8,7 @@ sync:
 # currently installed in the active environment.
 .PHONY: install
 install:
+	uv pip install pybind11 wheel setuptools
 	uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 
 # Switch the MuJoCo solver version (supported window: >=3.5,<3.12), e.g.
@@ -19,7 +20,7 @@ install:
 .PHONY: mujoco
 mujoco:
 	@test -n "$(MJ)" || (echo "usage: make mujoco MJ=3.10.0" && exit 1)
-	uv pip install "mujoco==$(MJ)" pybind11 wheel
+	uv pip install "mujoco==$(MJ)" pybind11 wheel setuptools
 	uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 
 .PHONY: lint
