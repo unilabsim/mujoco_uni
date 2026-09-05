@@ -11,7 +11,7 @@ MuJoCo solver, contact, integrator, or source-tree internals. Licensed Apache-2.
 
 Architecture (layered, bottom-up):
 
-- **Official MuJoCo** (`mujoco>=3.5,<3.11`): compiler, `mjModel`/`mjData`, solver, C API.
+- **Official MuJoCo** (`mujoco>=3.5,<3.12`): compiler, `mjModel`/`mjData`, solver, C API.
 - **Native C++ extension** (`mujoco_uni.compiled._batch_env`, pybind11, C++17): owns a
   per-environment `mjModel` pool (cloned with `mj_copyModel`), per-thread reusable
   `mjData` workers, and a local thread pool. Executes batched `mj_step` / `mj_forward` /
@@ -66,7 +66,7 @@ make test            # pytest
 make test-no-sync    # pytest with --no-sync (after `make mujoco MJ=...`)
 make check           # lint + test
 make matrix          # version-matrix checks across MuJoCo 3.5.0 / 3.6.0 / 3.7.0 /
-                     # 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0 (tools/version_matrix.py --pytest)
+                     # 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0 / 3.11.0 (tools/version_matrix.py --pytest)
 make test-unilab     # full UniLab task validation (sibling ../UniLab checkout)
 make test-unilab-train  # UniLab training smoke per MuJoCo environment
 make clean           # remove caches and build artifacts
@@ -118,14 +118,14 @@ Critical build facts:
 ## MuJoCo Version Policy
 
 - MuJoCoUni package version is independent of the MuJoCo solver version. Supported
-  solver range: `mujoco>=3.5,<3.11` (`metadata.py`); default `3.8.0`.
+  solver range: `mujoco>=3.5,<3.12` (`metadata.py`); default `3.11.0`.
 - **One MuJoCo version per Python environment/process.** Version switching is
   process-level: the `MUJOCO_UNI_VERSION` env var requests a version
   (`3.8` = any compatible `3.8.x`, `3.8.0` = exact), and
   `mujoco_uni.mujoco_runtime.version_control` discovers existing versioned uv
   environments matching `.venv-mj*` under the working directory, verifies them, and
   spawns the target command there **before** `mujoco` is imported.
-- Discovery preference order: `3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5`
+- Discovery preference order: `3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5`
   (`SUPPORTED_MUJOCO_MINOR_ORDER`). Missing/unusable requests fall back with a
   warning; no usable environment is a hard error.
 - Import-time fail-fast checks (`runtime/batch.py`): loaded `mujoco` must be in range,
@@ -252,7 +252,7 @@ gh run list --status=failure
 ## Release Process
 
 - CI/release: `.github/workflows/release.yml`, triggered by `v*` tags or manual
-  dispatch (with a `mujoco_version` input, default `3.8.0`).
+  dispatch (with a `mujoco_version` input, default `3.11.0`).
 - Pipeline: builds the sdist with `uv build --sdist`, installs it with
   `--no-build-isolation --no-binary`, and runs `python -m pytest tests/ -q` on a matrix
   of ubuntu (x64/arm), macOS, and Windows with Python 3.10 and 3.13. Only the sdist is

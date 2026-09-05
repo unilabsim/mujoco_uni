@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 UNILAB_ROOT = ROOT.parent / "UniLab"
-DEFAULT_VERSIONS = ("3.5.0", "3.6.0", "3.7.0", "3.8.0", "3.8.1", "3.9.0", "3.10.0")
+DEFAULT_VERSIONS = ("3.5.0", "3.6.0", "3.7.0", "3.8.0", "3.8.1", "3.9.0", "3.10.0", "3.11.0")
 
 
 def _python_path(env_dir: Path) -> Path:
@@ -64,7 +64,7 @@ from mujoco_uni.compiled import MUJOCO_BUILD_VERSION
 
 assert mj.__version__ == {expected_version!r}, mj.__version__
 assert MUJOCO_BUILD_VERSION == {expected_version!r}, MUJOCO_BUILD_VERSION
-assert mujoco_uni.MUJOCO_VERSION_SPEC == ">=3.5,<3.11"
+assert mujoco_uni.MUJOCO_VERSION_SPEC == ">=3.5,<3.12"
 
 model = mj.MjModel.from_xml_string(\"\"\"
 <mujoco>

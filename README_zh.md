@@ -82,7 +82,7 @@ MuJoCoUni 拥有自己的包版本，独立于 MuJoCo 求解器版本。
 
 ```text
 mujoco-uni-runtime==0.4.0
-mujoco>=3.5,<3.11
+mujoco>=3.5,<3.12
 ```
 
 公开元数据可在 Python 中获取：
@@ -106,12 +106,13 @@ env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni-runtime
 env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni-runtime
 env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni-runtime
 env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni-runtime
+env-mj311 -> mujoco==3.11.x -> build/install mujoco-uni-runtime
 ```
 
 默认与回退（fallback）选择按如下顺序优先使用已发现的环境：
 
 ```text
-3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
+3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
 ```
 
 如果未找到请求的版本，MuJoCoUni 会打印警告并回退到首选的现有环境。如果不存在任何 MuJoCo 环境，启动会以明确的配置错误而失败。
@@ -223,7 +224,7 @@ kd
 MuJoCoUni 以 `mujoco-uni-runtime` 之名发布（**仅源码分发 sdist**）：
 
 ```bash
-pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
+pip install "mujoco>=3.5,<3.12" pybind11 numpy setuptools wheel
 pip install mujoco-uni-runtime --no-build-isolation
 ```
 
@@ -240,7 +241,7 @@ uv 项目以声明式达到同样效果：
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.12", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]
@@ -315,7 +316,7 @@ uv run python tools/version_matrix.py --pytest
 默认矩阵覆盖：
 
 ```text
-3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0
+3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0 3.11.0
 ```
 
 完整的 UniLab 任务验证独立于快速包矩阵：

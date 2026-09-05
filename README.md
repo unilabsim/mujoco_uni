@@ -85,7 +85,7 @@ Current release:
 
 ```text
 mujoco-uni-runtime==0.4.0
-mujoco>=3.5,<3.11
+mujoco>=3.5,<3.12
 ```
 
 The public metadata is available from Python:
@@ -115,12 +115,13 @@ env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni-runtime
 env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni-runtime
 env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni-runtime
 env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni-runtime
+env-mj311 -> mujoco==3.11.x -> build/install mujoco-uni-runtime
 ```
 
 Default and fallback selection prefer discovered environments in this order:
 
 ```text
-3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
+3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
 ```
 
 If the requested version is not found, MuJoCoUni prints a warning and falls back
@@ -257,7 +258,7 @@ Returned model views remain valid only while the pool is alive.
 MuJoCoUni is published as `mujoco-uni-runtime` (**source distribution only**):
 
 ```bash
-pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
+pip install "mujoco>=3.5,<3.12" pybind11 numpy setuptools wheel
 pip install mujoco-uni-runtime --no-build-isolation
 ```
 
@@ -283,7 +284,7 @@ uv projects declare the same setup:
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco>=3.5,<3.12", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]
@@ -363,7 +364,7 @@ or `make matrix`. Full UniLab validation is available as `make test-unilab` and
 The default matrix covers:
 
 ```text
-3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0
+3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0 3.11.0
 ```
 
 Full UniLab task validation is separate from the quick package matrix:
