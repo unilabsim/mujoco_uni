@@ -84,8 +84,8 @@ MuJoCoUni has its own package version, independent of the MuJoCo solver version.
 Current release:
 
 ```text
-mujoco-uni-runtime==0.4.0
-mujoco>=3.5,<3.11
+mujoco-uni-runtime==0.5.0
+mujoco>=3.5,<3.12
 ```
 
 The public metadata is available from Python:
@@ -115,12 +115,13 @@ env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni-runtime
 env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni-runtime
 env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni-runtime
 env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni-runtime
+env-mj311 -> mujoco==3.11.x -> build/install mujoco-uni-runtime
 ```
 
 Default and fallback selection prefer discovered environments in this order:
 
 ```text
-3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
+3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
 ```
 
 If the requested version is not found, MuJoCoUni prints a warning and falls back
@@ -254,19 +255,30 @@ Returned model views remain valid only while the pool is alive.
 
 ## Installation
 
-MuJoCoUni is published as `mujoco-uni-runtime` (**source distribution only**):
+MuJoCoUni is published as `mujoco-uni-runtime`. The default install path is a
+**prebuilt wheel** bound to the default MuJoCo version (`3.11.0`), published
+for linux x86_64 / aarch64 and macOS arm64 × Python 3.10–3.13:
 
 ```bash
-pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
-pip install mujoco-uni-runtime --no-build-isolation
+pip install "mujoco==3.11.0" mujoco-uni-runtime
 ```
 
-There are no prebuilt wheels on purpose: the native extension is compiled
-against the `mujoco` package present at build time and refuses to load against
-any other MuJoCo version, so a prebuilt wheel would silently bind you to one
-MuJoCo release. Install with `--no-build-isolation` (as above) so the
-extension is compiled against the `mujoco` version of your target environment
-instead of a throwaway isolated one.
+One released runtime version carries exactly one MuJoCo binding (PyPI filename
+identity), and the native extension refuses to load against any MuJoCo version
+other than its build-time one (exact-version watchdog at import time).
+
+For any **non-default MuJoCo version**, the **sdist** is the fallback and the
+only path: build from source against your environment's `mujoco` with
+`--no-build-isolation` (so the build does not see a throwaway isolated
+environment). Windows users take this path as well — no Windows wheels.
+
+```bash
+pip install "mujoco>=3.5,<3.12" pybind11 numpy setuptools wheel
+pip install mujoco-uni-runtime --no-binary mujoco-uni-runtime --no-build-isolation
+```
+
+See [docs/release-coordination.md](docs/release-coordination.md) for the
+cross-repo release coordination rules.
 
 ### Prerequisites
 
@@ -283,7 +295,7 @@ uv projects declare the same setup:
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco~=3.11.0", "mujoco-uni-runtime==0.5.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]
@@ -363,7 +375,7 @@ or `make matrix`. Full UniLab validation is available as `make test-unilab` and
 The default matrix covers:
 
 ```text
-3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0
+3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0 3.11.0
 ```
 
 Full UniLab task validation is separate from the quick package matrix:

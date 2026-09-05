@@ -82,7 +82,9 @@ def _check_native_build_compatibility(native, runtime_version: str) -> None:
     raise ImportError(
         f"MuJoCoUni native batch extension was built against mujoco "
         f"{build_version!r}, but loaded mujoco is {runtime_version!r}. "
-        "Rebuild mujoco_uni inside the selected MuJoCo environment."
+        "Rebuild the extension from source against the active mujoco, e.g. "
+        "`make mujoco MJ=<version>` or reinstall from the sdist with "
+        "`--no-build-isolation` inside the selected MuJoCo environment."
     )
 
 

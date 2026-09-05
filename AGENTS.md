@@ -4,14 +4,14 @@ Guidance for AI coding agents working in this repository.
 
 ## Project Overview
 
-This repository is **MuJoCoUni** (PyPI package `mujoco-uni-runtime`, version `0.4.0`), a
+This repository is **MuJoCoUni** (PyPI package `mujoco-uni-runtime`, version `0.5.0`), a
 standalone batched executor layer for **official MuJoCo**. It provides the
 `BatchEnvPool` API consumed by the upstream **UniLab** project, without modifying
 MuJoCo solver, contact, integrator, or source-tree internals. Licensed Apache-2.0.
 
 Architecture (layered, bottom-up):
 
-- **Official MuJoCo** (`mujoco>=3.5,<3.11`): compiler, `mjModel`/`mjData`, solver, C API.
+- **Official MuJoCo** (`mujoco>=3.5,<3.12`): compiler, `mjModel`/`mjData`, solver, C API.
 - **Native C++ extension** (`mujoco_uni.compiled._batch_env`, pybind11, C++17): owns a
   per-environment `mjModel` pool (cloned with `mj_copyModel`), per-thread reusable
   `mjData` workers, and a local thread pool. Executes batched `mj_step` / `mj_forward` /
@@ -45,7 +45,8 @@ tools/
   strict_ab_mj38.py           # strict A/B performance benchmark harness (mj 3.8)
                               # report: github.com/unilabsim/mujoco_uni/discussions/4
 Makefile                      # common dev commands (sync/install/lint/test/matrix/...)
-.github/workflows/release.yml # sdist build/test matrix + PyPI publish on v* tags
+docs/release-coordination.md  # cross-repo release rules (wheel matrix, MuJoCo binding)
+.github/workflows/release.yml # sdist + 12-wheel build/test matrix, PyPI publish on v* tags
 ```
 
 ## Build and Test Commands
@@ -66,7 +67,7 @@ make test            # pytest
 make test-no-sync    # pytest with --no-sync (after `make mujoco MJ=...`)
 make check           # lint + test
 make matrix          # version-matrix checks across MuJoCo 3.5.0 / 3.6.0 / 3.7.0 /
-                     # 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0 (tools/version_matrix.py --pytest)
+                     # 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0 / 3.11.0 (tools/version_matrix.py --pytest)
 make test-unilab     # full UniLab task validation (sibling ../UniLab checkout)
 make test-unilab-train  # UniLab training smoke per MuJoCo environment
 make clean           # remove caches and build artifacts
@@ -92,11 +93,14 @@ uv run python tools/version_matrix.py --pytest
 
 Critical build facts:
 
-- The package is **source distribution only — no prebuilt wheels on purpose**. The
-  native extension is compiled against the `mujoco` package present at build time and
-  **refuses to load against any other MuJoCo version** (exact-version watchdog at
-  import time). Always install with `--no-build-isolation` so the build sees the
-  target environment's `mujoco`.
+- The **default install path is a prebuilt wheel** bound to the repo-default
+  MuJoCo (`3.11.0`): one released runtime version carries exactly one MuJoCo
+  binding (PyPI filename identity). The **sdist remains the fallback and the
+  only path for non-default MuJoCo versions** — install it with
+  `--no-build-isolation` so the build sees the target environment's `mujoco`.
+  Either way, the native extension **refuses to load against any MuJoCo
+  version other than its build-time one** (exact-version watchdog at import
+  time). See `docs/release-coordination.md` for the cross-repo rules.
 - Building from source requires a C++17 toolchain and Python dev headers (bundled in
   uv-managed Pythons).
 - Editable installs generate a local artifact like
@@ -105,7 +109,7 @@ Critical build facts:
   environments, Python versions, or MuJoCo versions**:
 
   ```bash
-  uv pip install "mujoco==3.10.0" pybind11 wheel
+  uv pip install "mujoco==3.11.0" pybind11 wheel setuptools
   uv pip install --force-reinstall --no-deps --no-build-isolation -e .
   ```
 
@@ -118,14 +122,14 @@ Critical build facts:
 ## MuJoCo Version Policy
 
 - MuJoCoUni package version is independent of the MuJoCo solver version. Supported
-  solver range: `mujoco>=3.5,<3.11` (`metadata.py`); default `3.8.0`.
+  solver range: `mujoco>=3.5,<3.12` (`metadata.py`); default `3.11.0`.
 - **One MuJoCo version per Python environment/process.** Version switching is
   process-level: the `MUJOCO_UNI_VERSION` env var requests a version
   (`3.8` = any compatible `3.8.x`, `3.8.0` = exact), and
   `mujoco_uni.mujoco_runtime.version_control` discovers existing versioned uv
   environments matching `.venv-mj*` under the working directory, verifies them, and
   spawns the target command there **before** `mujoco` is imported.
-- Discovery preference order: `3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5`
+- Discovery preference order: `3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5`
   (`SUPPORTED_MUJOCO_MINOR_ORDER`). Missing/unusable requests fall back with a
   warning; no usable environment is a hard error.
 - Import-time fail-fast checks (`runtime/batch.py`): loaded `mujoco` must be in range,
@@ -238,7 +242,9 @@ PR gate before creating or updating a PR:
    result in the PR body.
 3. The remote release workflow (`.github/workflows/release.yml`) runs only on
    `v*` tags and manual dispatch, so PRs are gated by the local checks plus
-   review, not by remote CI.
+   review, not by remote CI. Manual dispatch builds and verifies the full
+   sdist + wheel matrix without publishing; use it to verify a head SHA
+   before tagging.
 
 ### CI workflow runs
 
@@ -252,8 +258,17 @@ gh run list --status=failure
 ## Release Process
 
 - CI/release: `.github/workflows/release.yml`, triggered by `v*` tags or manual
-  dispatch (with a `mujoco_version` input, default `3.8.0`).
-- Pipeline: builds the sdist with `uv build --sdist`, installs it with
+  dispatch (with a `mujoco_version` input for the sdist matrix, default `3.11.0`).
+- Pipeline, sdist job: builds the sdist with `uv build --sdist`, installs it with
   `--no-build-isolation --no-binary`, and runs `python -m pytest tests/ -q` on a matrix
-  of ubuntu (x64/arm), macOS, and Windows with Python 3.10 and 3.13. Only the sdist is
-  published to PyPI (`skip-existing: true`).
+  of ubuntu (x64/arm), macOS, and Windows with Python 3.10 and 3.13.
+- Pipeline, wheel job: builds prebuilt wheels against `mujoco==3.11.0`
+  (`WHEEL_MUJOCO_VERSION`, `uv build --wheel --no-build-isolation`, linux wheels
+  retagged manylinux via `auditwheel --exclude libmujoco.so.3.11.0`) on
+  linux x86_64 / linux aarch64 / darwin arm64 × Python 3.10–3.13 (12 wheels),
+  smoke-testing each wheel in a fresh environment. Windows wheels are out of
+  scope (incompatible Windows header layout).
+- Publish (tag pushes only; dispatch is build/verify only): uploads the sdist
+  plus all 12 wheels to PyPI via trusted publishing (`environment: pypi`,
+  `skip-existing: true`). See `docs/release-coordination.md` for the
+  coordination rules this implements.

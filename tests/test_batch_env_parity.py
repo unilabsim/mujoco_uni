@@ -139,7 +139,7 @@ raise SystemExit("expected ImportError")
       text=True,
   )
   assert result.returncode == 0, result.stdout + result.stderr
-  assert "supports official mujoco>=3.5,<3.11" in result.stdout
+  assert "supports official mujoco>=3.5,<3.12" in result.stdout
 
 
 def test_mujoco_build_runtime_mismatch_fails_fast() -> None:
@@ -168,7 +168,8 @@ raise SystemExit("expected ImportError")
   )
   assert result.returncode == 0, result.stdout + result.stderr
   assert "native batch extension was built against mujoco" in result.stdout
-  assert "Rebuild mujoco_uni inside the selected MuJoCo environment" in result.stdout
+  assert "Rebuild the extension from source against the active mujoco" in result.stdout
+  assert "make mujoco MJ=" in result.stdout
 
 
 def test_constructor_accepts_single_model_and_model_sequences() -> None:

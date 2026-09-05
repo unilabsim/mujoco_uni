@@ -6,18 +6,21 @@ on:
   workflow_dispatch:
     inputs:
       mujoco_version:
-        description: MuJoCo version used for the build/test matrix
+        description: MuJoCo version used for the sdist build/test matrix
         required: true
-        default: "3.8.0"
+        default: "3.11.0"
 
 env:
-  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.8.0' }}
+  # The sdist build/test matrix exercises the requested MuJoCo version.
+  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.11.0' }}
+  # Prebuilt wheels are always bound to the repo-default MuJoCo version: one
+  # released runtime version carries exactly one MuJoCo binding (PyPI filename
+  # identity), so the wheel matrix ignores the dispatch input on purpose.
+  WHEEL_MUJOCO_VERSION: "3.11.0"
 
 jobs:
   # Verify that the sdist compiles and passes tests on every supported
-  # platform. Nothing but the sdist is published: the native extension is
-  # bound to the mujoco version present at build time, so prebuilt wheels
-  # would silently pin consumers to one MuJoCo release.
+  # platform, against the requested MuJoCo version.
   build-and-test:
     strategy:
       fail-fast: false
@@ -44,8 +47,79 @@ jobs:
           name: sdist
           path: dist/
 
+  # Build one prebuilt wheel per (platform, Python) cell, always against the
+  # repo-default MuJoCo binding, and smoke-test each wheel in a fresh
+  # environment with exactly that mujoco version installed. Windows wheels
+  # stay out of scope (incompatible Windows header layout).
+  build-wheel:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv pip install --system "mujoco==${{ env.WHEEL_MUJOCO_VERSION }}" pybind11 numpy setuptools wheel
+      - name: build the wheel against the environment's mujoco
+        run: uv build --wheel --no-build-isolation --out-dir dist
+      - name: retag linux wheels as manylinux
+        if: runner.os == 'Linux'
+        run: |
+          uv pip install --system auditwheel patchelf
+          auditwheel repair dist/*.whl --exclude "libmujoco.so.${{ env.WHEEL_MUJOCO_VERSION }}" --wheel-dir dist/repaired
+          rm dist/*-linux_*.whl
+          mv dist/repaired/*.whl dist/
+      - name: smoke-test the wheel in a fresh environment
+        run: |
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv/bin/python "mujoco==${{ env.WHEEL_MUJOCO_VERSION }}" dist/*.whl
+          .smoke-venv/bin/python - <<'PY'
+          import numpy as np
+          import mujoco as mj
+          import os
+
+          from mujoco_uni.batch_env import BatchEnvPool
+          from mujoco_uni.compiled import MUJOCO_BUILD_VERSION
+
+          expected = os.environ["WHEEL_MUJOCO_VERSION"]
+          assert mj.__version__ == expected, mj.__version__
+          assert MUJOCO_BUILD_VERSION == expected, MUJOCO_BUILD_VERSION
+
+          model = mj.MjModel.from_xml_string("""
+          <mujoco>
+            <worldbody>
+              <body name="pendulum" pos="0 0 0.5">
+                <joint name="hinge" type="hinge" axis="0 1 0"/>
+                <geom type="capsule" size="0.02 0.3" mass="1"/>
+              </body>
+            </worldbody>
+          </mujoco>
+          """)
+          data = mj.MjData(model)
+          state = np.zeros(mj.mj_stateSize(model, int(mj.mjtState.mjSTATE_FULLPHYSICS)))
+          mj.mj_getState(model, data, state, int(mj.mjtState.mjSTATE_FULLPHYSICS))
+          states = np.vstack([state, state])
+          with BatchEnvPool(model, nbatch=2, nthread=2) as pool:
+              sensed = pool.forward(states)
+              stepped = pool.step(states, nstep=5)
+              assert stepped.shape == (2, state.shape[0])
+          print("wheel smoke ok:", mj.__version__, "build", MUJOCO_BUILD_VERSION)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.python }}
+          path: dist/*.whl
+
+  # Publish the sdist and all prebuilt wheels. Tag pushes only: manual
+  # dispatch runs the full build/verify matrix above but never uploads.
   publish:
-    needs: build-and-test
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-and-test, build-wheel]
     runs-on: ubuntu-latest
     permissions:
       id-token: write # trusted publishing (no API token stored in GitHub)
@@ -55,6 +129,12 @@ jobs:
         with:
           name: sdist
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - run: ls -1 dist
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true

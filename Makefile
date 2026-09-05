@@ -8,9 +8,10 @@ sync:
 # currently installed in the active environment.
 .PHONY: install
 install:
+	uv pip install pybind11 wheel setuptools
 	uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 
-# Switch the MuJoCo solver version (supported window: >=3.5,<3.11), e.g.
+# Switch the MuJoCo solver version (supported window: >=3.5,<3.12), e.g.
 #   make mujoco MJ=3.10.0
 # Installs the requested mujoco into the active environment, then rebuilds the
 # native extension against it (the extension refuses to load on a version
@@ -19,7 +20,7 @@ install:
 .PHONY: mujoco
 mujoco:
 	@test -n "$(MJ)" || (echo "usage: make mujoco MJ=3.10.0" && exit 1)
-	uv pip install "mujoco==$(MJ)" pybind11 wheel
+	uv pip install "mujoco==$(MJ)" pybind11 wheel setuptools
 	uv pip install --force-reinstall --no-deps --no-build-isolation -e .
 
 .PHONY: lint
@@ -39,7 +40,7 @@ test-no-sync:
 .PHONY: check
 check: lint test
 
-# Version-matrix checks across MuJoCo 3.5.0 / 3.6.0 / 3.7.0 / 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0
+# Version-matrix checks across MuJoCo 3.5.0 / 3.6.0 / 3.7.0 / 3.8.0 / 3.8.1 / 3.9.0 / 3.10.0 / 3.11.0
 .PHONY: matrix
 matrix:
 	uv run python tools/version_matrix.py --pytest

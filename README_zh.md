@@ -81,8 +81,8 @@ MuJoCoUni 拥有自己的包版本，独立于 MuJoCo 求解器版本。
 当前发布版本：
 
 ```text
-mujoco-uni-runtime==0.4.0
-mujoco>=3.5,<3.11
+mujoco-uni-runtime==0.5.0
+mujoco>=3.5,<3.12
 ```
 
 公开元数据可在 Python 中获取：
@@ -106,12 +106,13 @@ env-mj37  -> mujoco==3.7.x  -> build/install mujoco-uni-runtime
 env-mj38  -> mujoco==3.8.x  -> build/install mujoco-uni-runtime
 env-mj39  -> mujoco==3.9.x  -> build/install mujoco-uni-runtime
 env-mj310 -> mujoco==3.10.x -> build/install mujoco-uni-runtime
+env-mj311 -> mujoco==3.11.x -> build/install mujoco-uni-runtime
 ```
 
 默认与回退（fallback）选择按如下顺序优先使用已发现的环境：
 
 ```text
-3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
+3.11 > 3.8 > 3.10 > 3.9 > 3.7 > 3.6 > 3.5
 ```
 
 如果未找到请求的版本，MuJoCoUni 会打印警告并回退到首选的现有环境。如果不存在任何 MuJoCo 环境，启动会以明确的配置错误而失败。
@@ -220,14 +221,22 @@ kd
 
 ## 安装
 
-MuJoCoUni 以 `mujoco-uni-runtime` 之名发布（**仅源码分发 sdist**）：
+MuJoCoUni 以 `mujoco-uni-runtime` 之名发布。默认安装路径是绑定默认 MuJoCo 版本（`3.11.0`）的**预编译 wheel**，覆盖 linux x86_64 / aarch64 与 macOS arm64 × Python 3.10–3.13：
 
 ```bash
-pip install "mujoco>=3.5,<3.11" pybind11 numpy setuptools wheel
-pip install mujoco-uni-runtime --no-build-isolation
+pip install "mujoco==3.11.0" mujoco-uni-runtime
 ```
 
-刻意不提供预编译 wheel：原生扩展针对构建时环境中的 `mujoco` 编译，且拒绝在其它 MuJoCo 版本下加载，预编译 wheel 会把你隐式绑定到某一个 MuJoCo 版本。请使用 `--no-build-isolation`（如上），使扩展针对目标环境中的 `mujoco` 版本编译，而不是一次性的隔离构建环境。
+每个发布的运行时版本只携带一个 MuJoCo 绑定（PyPI 文件名唯一性约束），且原生扩展拒绝在构建时版本以外的任何 MuJoCo 版本下加载（导入时的精确版本看门狗）。
+
+对于任何**非默认 MuJoCo 版本**，**sdist** 是兜底且唯一的路径：使用 `--no-build-isolation` 针对你环境中的 `mujoco` 从源码构建（避免构建发生在一次性的隔离环境中）。Windows 用户同样走此路径 —— 不提供 Windows wheel。
+
+```bash
+pip install "mujoco>=3.5,<3.12" pybind11 numpy setuptools wheel
+pip install mujoco-uni-runtime --no-binary mujoco-uni-runtime --no-build-isolation
+```
+
+跨仓库的发布协调规则见 [docs/release-coordination.md](docs/release-coordination.md)。
 
 ### 前置要求
 
@@ -240,7 +249,7 @@ uv 项目以声明式达到同样效果：
 
 ```toml
 [project.optional-dependencies]
-mujoco = ["mujoco>=3.5,<3.11", "mujoco-uni-runtime==0.4.0", "pybind11>=2.12", "wheel"]
+mujoco = ["mujoco~=3.11.0", "mujoco-uni-runtime==0.5.0", "pybind11>=2.12", "wheel"]
 
 [tool.uv]
 no-build-isolation-package = ["mujoco-uni-runtime"]
@@ -315,7 +324,7 @@ uv run python tools/version_matrix.py --pytest
 默认矩阵覆盖：
 
 ```text
-3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0
+3.5.0 3.6.0 3.7.0 3.8.0 3.8.1 3.9.0 3.10.0 3.11.0
 ```
 
 完整的 UniLab 任务验证独立于快速包矩阵：

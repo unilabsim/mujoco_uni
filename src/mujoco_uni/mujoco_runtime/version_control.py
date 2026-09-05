@@ -24,7 +24,7 @@ from mujoco_uni.metadata import (
     MUJOCO_VERSION_SPEC,
 )
 
-SUPPORTED_MUJOCO_MINOR_ORDER = ("3.8", "3.10", "3.9", "3.7", "3.6", "3.5")
+SUPPORTED_MUJOCO_MINOR_ORDER = ("3.11", "3.8", "3.10", "3.9", "3.7", "3.6", "3.5")
 MUJOCO_UNI_VERSION_ENV = "MUJOCO_UNI_VERSION"
 
 
@@ -289,7 +289,7 @@ def run_in_env(
     if not envs:
         raise RuntimeError(
             "No existing MuJoCo environments were found. Create one before launch, "
-            "for example .venv-mj38 or .venv-mj310."
+            "for example .venv-mj311, .venv-mj38, or .venv-mj310."
         )
 
     primary = _matching_envs(envs, version)
