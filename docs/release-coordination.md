@@ -47,8 +47,8 @@ with it:
 
 = 12 wheels per release, all built against `mujoco==3.11.0` with
 `--no-build-isolation`, smoke-tested in CI before upload. Windows wheels are
-out of scope (incompatible Windows header layout); Windows users install the
-sdist, which is exercised on `windows-latest` in the sdist test matrix.
+out of scope; Windows users install the sdist, which is exercised on
+`windows-latest` in the sdist test matrix.
 
 ## Release flow
 

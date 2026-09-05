@@ -114,7 +114,9 @@ Critical build facts:
   ```
 
 - `setup.py` contains a custom `build_ext`: it injects pybind11/numpy/mujoco include
-  dirs, defines `MUJOCO_UNI_BUILD_MUJOCO_VERSION`, links directly against the
+  dirs (`find_mujoco_include_dir` probes the classic `mujoco/include` layout
+  first, then the nested `mujoco/include/mujoco` layout used by Windows wheels
+  since 3.10.0), defines `MUJOCO_UNI_BUILD_MUJOCO_VERSION`, links directly against the
   `libmujoco*` / `mujoco.dll` shipped inside the `mujoco` wheel, sets rpath to
   `$ORIGIN/../../mujoco` (Linux) / `@loader_path/../../mujoco` (macOS), and generates
   an MSVC import library from referenced `mj*`/`mju*` symbols on Windows.
@@ -267,7 +269,7 @@ gh run list --status=failure
   retagged manylinux via `auditwheel --exclude libmujoco.so.3.11.0`) on
   linux x86_64 / linux aarch64 / darwin arm64 × Python 3.10–3.13 (12 wheels),
   smoke-testing each wheel in a fresh environment. Windows wheels are out of
-  scope (incompatible Windows header layout).
+  scope; the sdist path covers Windows (`windows-latest` in the sdist matrix).
 - Publish (tag pushes only; dispatch is build/verify only): uploads the sdist
   plus all 12 wheels to PyPI via trusted publishing (`environment: pypi`,
   `skip-existing: true`). See `docs/release-coordination.md` for the
