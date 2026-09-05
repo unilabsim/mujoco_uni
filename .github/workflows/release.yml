@@ -8,10 +8,10 @@ on:
       mujoco_version:
         description: MuJoCo version used for the build/test matrix
         required: true
-        default: "3.8.0"
+        default: "3.11.0"
 
 env:
-  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.8.0' }}
+  MUJOCO_VERSION: ${{ inputs.mujoco_version || '3.11.0' }}
 
 jobs:
   # Verify that the sdist compiles and passes tests on every supported
