@@ -50,7 +50,7 @@ jobs:
   # Build one prebuilt wheel per (platform, Python) cell, always against the
   # repo-default MuJoCo binding, and smoke-test each wheel in a fresh
   # environment with exactly that mujoco version installed. Windows wheels
-  # stay out of scope (incompatible Windows header layout).
+  # stay out of scope; the sdist path covers Windows.
   build-wheel:
     strategy:
       fail-fast: false
